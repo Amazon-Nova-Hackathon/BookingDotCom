@@ -1,0 +1,57 @@
+version: "3.8"
+
+services:
+  browser-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    ports:
+      - "7863:7863"
+    env_file:
+      - .env
+    environment:
+      - PORT=7863
+      - HOST=0.0.0.0
+    volumes:
+      - ./browser_data:/app/browser_data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7863/api/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - booking-network
+
+  voice-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    environment:
+      - PORT=7860
+      - HOST=0.0.0.0
+      - BROWSER_SERVICE_URL=http://browser-agent:7863
+    depends_on:
+      browser-agent:
+        condition: service_healthy
+    networks:
+      - booking-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - HOST=0.0.0.0
+    networks:
+      - booking-network
+
+networks:
+  booking-network:
+    driver: bridge

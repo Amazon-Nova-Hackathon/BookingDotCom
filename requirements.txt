@@ -1,0 +1,23 @@
+# Core
+python-dotenv==1.2.1
+aiohttp==3.12.15
+loguru==0.7.3
+boto3==1.38.27
+
+# Pipecat AI - Nova Sonic S2S + WebRTC + Silero VAD
+pipecat-ai[aws,webrtc,aws-nova-sonic,silero]==0.0.91
+
+# Browser automation
+browser-use==0.9.5
+playwright==1.55.0
+
+# LangChain (for Bedrock integration with browser-use)
+langchain==0.3.27
+langchain-core==0.3.79
+langchain-aws==0.2.27
+
+# Audio processing
+numpy>=1.26.4
+
+# JSON
+orjson==3.11.4
