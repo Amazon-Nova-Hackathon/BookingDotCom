@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from src.browser_agent import browser_agent
+from src.playwright_agent import booking_agent
 
 load_dotenv(override=True)
 
@@ -39,7 +39,7 @@ async def execute_action(request):
         )
         logger.debug(f"[{request_id}] Params: {json.dumps(params, default=str)}")
 
-        agent_result = await browser_agent.execute_action(
+        agent_result = await booking_agent.execute_action(
             action=action,
             params=params,
             session_id=session_id,
@@ -64,7 +64,37 @@ async def health_check(request):
     return web.json_response({"status": "ok"})
 
 
-app = web.Application()
+@routes.get("/screenshot")
+async def get_screenshot(request):
+    """
+    Return the latest Playwright screenshot as PNG.
+    The frontend polls this every ~400ms to get a live browser view.
+    """
+    png = booking_agent.get_screenshot()
+    if png is None:
+        # Return a 1x1 transparent PNG placeholder
+        return web.Response(status=204)
+    return web.Response(
+        body=png,
+        content_type="image/png",
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
+    )
+
+
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        return web.Response(headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        })
+    response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+app = web.Application(middlewares=[cors_middleware])
 app.add_routes(routes)
 
 if __name__ == "__main__":
@@ -72,3 +102,4 @@ if __name__ == "__main__":
     HOST = os.getenv("HOST", "0.0.0.0")
     logger.info(f"Starting Browser Agent Service on {HOST}:{PORT}")
     web.run_app(app, host=HOST, port=PORT)
+
