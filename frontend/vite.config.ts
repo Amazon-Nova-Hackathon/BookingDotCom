@@ -17,11 +17,6 @@ export default defineConfig({
         target: 'http://127.0.0.1:7860',
         changeOrigin: true,
       },
-      '/ws': {
-        target: 'http://127.0.0.1:7860',
-        changeOrigin: true,
-        ws: true,
-      },
       '/events': {
         target: 'http://127.0.0.1:7860',
         changeOrigin: true,
@@ -37,7 +32,6 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:7860',
         changeOrigin: true,
-        ws: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
     },

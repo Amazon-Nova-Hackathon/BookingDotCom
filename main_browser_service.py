@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from src.browser_agent import booking_agent
+from src.playwright_agent import booking_agent
 
 load_dotenv(override=True)
 
@@ -95,31 +95,63 @@ async def get_screenshot(request):
     )
 
 
-@routes.post("/api/interact")
-async def interact(request):
-    """Forward user mouse/keyboard interaction to the live browser."""
+@routes.get("/ws/browser")
+async def ws_browser(request):
+    """
+    WebSocket endpoint for CDP screencast streaming + user input forwarding.
+    Server → Client: {"type": "frame", "data": "<base64 JPEG>"}
+    Client → Server: {"type": "click"|"type"|"keypress"|"scroll", ...}
+    """
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    logger.info("[WS] Browser WebSocket connected")
+
+    if not booking_agent.is_running:
+        logger.error("[WS] Browser not initialized — rejecting")
+        await ws.close()
+        return ws
+
+    # Define callback to push frames
+    async def push_frame(base64_jpeg: str):
+        if not ws.closed:
+            try:
+                await ws.send_json({"type": "frame", "data": base64_jpeg})
+            except Exception:
+                pass
+
+    # Start CDP screencast
+    await booking_agent.start_screencast(push_frame)
+
     try:
-        data = await request.json()
-        action = data.get("action")
-        ok = False
-
-        if action == "click":
-            ok = await booking_agent.user_click(int(data["x"]), int(data["y"]))
-        elif action == "scroll":
-            ok = await booking_agent.user_scroll(
-                int(data.get("x", 0)), int(data.get("y", 0)),
-                int(data.get("deltaX", 0)), int(data.get("deltaY", 0)),
-            )
-        elif action == "type":
-            ok = await booking_agent.user_type(data.get("text", ""))
-        elif action == "keypress":
-            ok = await booking_agent.user_keypress(data.get("key", "Enter"))
-        else:
-            return web.json_response({"ok": False, "error": f"Unknown action: {action}"}, status=400)
-
-        return web.json_response({"ok": ok})
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    action = data.get("type")
+                    if action == "click":
+                        await booking_agent.cdp_click(int(data["x"]), int(data["y"]))
+                    elif action == "type":
+                        await booking_agent.cdp_type(data.get("text", ""))
+                    elif action == "keypress":
+                        await booking_agent.cdp_keypress(data.get("key", ""))
+                    elif action == "scroll":
+                        await booking_agent.cdp_scroll(
+                            int(data.get("x", 0)), int(data.get("y", 0)),
+                            int(data.get("deltaX", 0)), int(data.get("deltaY", 0)),
+                        )
+                    elif action == "mousemove":
+                        await booking_agent.cdp_mousemove(int(data["x"]), int(data["y"]))
+                except Exception as e:
+                    logger.warning(f"[WS] Input error: {e}")
+            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                break
     except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=500)
+        logger.warning(f"[WS] Connection error: {e}")
+    finally:
+        await booking_agent.stop_screencast()
+        logger.info("[WS] Browser WebSocket disconnected")
+
+    return ws
 
 
 @web.middleware
@@ -135,7 +167,15 @@ async def cors_middleware(request, handler):
     return response
 
 
+async def on_startup(app):
+    """Pre-initialize Playwright browser so it's ready before any request."""
+    logger.info("Pre-initializing browser...")
+    await booking_agent.init_browser()
+    logger.info("Browser ready — accepting connections.")
+
+
 app = web.Application(middlewares=[cors_middleware])
+app.on_startup.append(on_startup)
 app.add_routes(routes)
 
 if __name__ == "__main__":

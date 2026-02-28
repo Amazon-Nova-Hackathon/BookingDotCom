@@ -19,9 +19,9 @@ export default function App() {
     const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
     const [bookingParams, setBookingParams] = useState<BookingParams>({});
     const [isBrowserActive, setIsBrowserActive] = useState(false);
-    const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null);
-    const [browserStatus, setBrowserStatus] = useState('Chờ yêu cầu tìm kiếm...');
+    const [browserStatus, setBrowserStatus] = useState('Waiting for search request...');
     const [isMuted, setIsMuted] = useState(false);
+    const [hasBrowserFrame, setHasBrowserFrame] = useState(false);
 
     const pcRef = useRef<RTCPeerConnection | null>(null);
     const pcIdRef = useRef<string | null>(null);
@@ -29,65 +29,139 @@ export default function App() {
     const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const eventSourceRef = useRef<EventSource | null>(null);
-    const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const sseReconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const disconnectedRef = useRef(true); // start as "disconnected" so polling doesn't auto-activate browser
-    const screenshotImgRef = useRef<HTMLImageElement>(null);
-    const fetchingScreenshotRef = useRef(false); // guard against overlapping requests
+    const disconnectedRef = useRef(true);
+    const browserWsReconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const browserWsRetryCount = useRef(0);
+
+    // Canvas + WebSocket refs for CDP screencast
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+    const browserWsRef = useRef<WebSocket | null>(null);
+    const imgDecoderRef = useRef(new Image());
 
     useEffect(() => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [chatHistory]);
 
-    // ── Screenshot polling ─────────────────────────────────────────────────────
-    const startScreenshotPolling = useCallback(() => {
-        if (pollIntervalRef.current) return;
-        console.log('[Browser] Starting screenshot polling');
-        pollIntervalRef.current = setInterval(async () => {
-            // Don't activate browser when intentionally disconnected
-            if (disconnectedRef.current) return;
-            // Skip if a previous fetch is still in-flight
-            if (fetchingScreenshotRef.current) return;
-            fetchingScreenshotRef.current = true;
+    // ── Browser WebSocket (CDP screencast) ─────────────────────────────────
+    const connectBrowserWs = useCallback(() => {
+        if (browserWsRef.current?.readyState === WebSocket.OPEN) return;
+
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsHost = location.hostname + ':7863';
+        const ws = new WebSocket(`${proto}://${wsHost}/ws/browser`);
+        browserWsRef.current = ws;
+
+        ws.onopen = () => {
+            console.log('[BrowserWS] Connected');
+            setIsBrowserActive(true);
+        };
+
+        ws.onmessage = (e) => {
             try {
-                const res = await fetch('/api/screenshot', { cache: 'no-store' });
-                if (res.status === 200 && res.headers.get('content-type')?.includes('image')) {
-                    const blob = await res.blob();
-                    if (blob.size > 100) {
-                        const url = URL.createObjectURL(blob);
-                        setScreenshotUrl(prev => {
-                            if (prev) URL.revokeObjectURL(prev);
-                            return url;
-                        });
-                        setIsBrowserActive(true);
-                    }
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'frame' && msg.data) {
+                    const img = imgDecoderRef.current;
+                    img.onload = () => {
+                        const canvas = canvasRef.current;
+                        if (canvas) {
+                            const ctx = canvas.getContext('2d');
+                            if (ctx) {
+                                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                                if (!hasBrowserFrame) setHasBrowserFrame(true);
+                            }
+                        }
+                    };
+                    img.src = `data:image/jpeg;base64,${msg.data}`;
                 }
-            } catch { /* browser service not running */ }
-            finally { fetchingScreenshotRef.current = false; }
-        }, 800);
+            } catch { /* ignore parse errors */ }
+        };
+
+        ws.onclose = () => {
+            console.log('[BrowserWS] Disconnected');
+            browserWsRef.current = null;
+            // Reconnect with backoff if browser is still active
+            if (isBrowserActive && !disconnectedRef.current) {
+                const delay = Math.min(1000 * Math.pow(2, browserWsRetryCount.current), 5000);
+                browserWsRetryCount.current++;
+                console.log(`[BrowserWS] Reconnecting in ${delay}ms (attempt ${browserWsRetryCount.current})`);
+                browserWsReconnectTimer.current = setTimeout(connectBrowserWs, delay);
+            }
+        };
+
+        ws.onerror = () => {
+            ws.close();
+        };
+    }, [hasBrowserFrame, isBrowserActive]);
+
+    const disconnectBrowserWs = useCallback(() => {
+        if (browserWsReconnectTimer.current) {
+            clearTimeout(browserWsReconnectTimer.current);
+            browserWsReconnectTimer.current = null;
+        }
+        browserWsRetryCount.current = 0;
+        if (browserWsRef.current) {
+            browserWsRef.current.close();
+            browserWsRef.current = null;
+        }
+        setHasBrowserFrame(false);
     }, []);
 
-    const stopScreenshotPolling = useCallback(() => {
-        if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current);
-            pollIntervalRef.current = null;
+    // ── Send input events to browser via WebSocket ─────────────────────────
+    const sendBrowserInput = useCallback((payload: Record<string, unknown>) => {
+        const ws = browserWsRef.current;
+        if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(payload));
         }
     }, []);
 
-    // ── SSE ───────────────────────────────────────────────────────────────────
+    // Scale canvas click position → browser viewport (1280×800)
+    const scaleCoords = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+        const canvas = canvasRef.current;
+        if (!canvas) return { x: 0, y: 0 };
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: Math.round((e.clientX - rect.left) / rect.width * 1280),
+            y: Math.round((e.clientY - rect.top) / rect.height * 800),
+        };
+    }, []);
+
+    const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+        const { x, y } = scaleCoords(e);
+        console.log(`[Click] (${x}, ${y})`);
+        sendBrowserInput({ type: 'click', x, y });
+    }, [scaleCoords, sendBrowserInput]);
+
+    const handleCanvasScroll = useCallback((e: React.WheelEvent<HTMLCanvasElement>) => {
+        e.preventDefault();
+        const { x, y } = scaleCoords(e);
+        sendBrowserInput({ type: 'scroll', x, y, deltaX: e.deltaX, deltaY: Math.round(e.deltaY) });
+    }, [scaleCoords, sendBrowserInput]);
+
+    const handleCanvasKeyDown = useCallback((e: React.KeyboardEvent<HTMLCanvasElement>) => {
+        const specialKeys = ['Enter', 'Tab', 'Escape', 'Backspace', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Delete', 'Home', 'End', 'PageUp', 'PageDown'];
+        if (specialKeys.includes(e.key)) {
+            e.preventDefault();
+            sendBrowserInput({ type: 'keypress', key: e.key });
+        } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            e.preventDefault();
+            sendBrowserInput({ type: 'type', text: e.key });
+        }
+    }, [sendBrowserInput]);
+
+    // ── SSE ───────────────────────────────────────────────────────────────
     const connectSSE = useCallback(() => {
         if (eventSourceRef.current) return;
         if (disconnectedRef.current) return;
-        console.log('[SSE] Connecting to /api/events...');
+        console.log('[SSE] Connecting...');
         const es = new EventSource('/api/events');
         eventSourceRef.current = es;
 
-        es.onopen = () => console.log('[SSE] Connected successfully');
+        es.onopen = () => console.log('[SSE] Connected');
 
         es.onmessage = (evt) => {
             try {
                 const data = JSON.parse(evt.data);
-                console.log('[SSE] Event received:', data.type, data);
                 switch (data.type) {
                     case 'user_transcript':
                         setChatHistory(h => [...h, { role: 'user', text: data.text }]);
@@ -102,40 +176,37 @@ export default function App() {
                         });
                         break;
                     case 'tool_called':
-                        console.log('[SSE] Tool called! Starting browser view...');
                         setBookingParams(data.args ?? {});
                         setIsBrowserActive(true);
-                        setBrowserStatus('🤖 Đang thao tác trên Booking.com...');
+                        setBrowserStatus('🤖 Searching on Booking.com...');
+                        // Connect browser WS when tool is called
+                        connectBrowserWs();
                         break;
                     case 'tool_result':
-                        console.log('[SSE] Tool result received');
-                        setBrowserStatus(data.error ? '❌ Tìm kiếm thất bại' : '✅ Tìm kiếm hoàn tất');
+                        setBrowserStatus(data.error ? '❌ Search failed' : '✅ Search complete');
                         break;
                 }
             } catch { }
         };
 
-        es.onerror = (err) => {
-            console.log('[SSE] Error, will reconnect in 2s', err);
+        es.onerror = () => {
             es.close();
             eventSourceRef.current = null;
             if (!disconnectedRef.current) {
                 sseReconnectTimer.current = setTimeout(connectSSE, 2000);
             }
         };
-    }, []);
+    }, [connectBrowserWs]);
 
     useEffect(() => {
-        // Start polling on mount (but disconnectedRef=true prevents browser activation)
-        startScreenshotPolling();
         return () => {
             eventSourceRef.current?.close();
-            stopScreenshotPolling();
+            disconnectBrowserWs();
             if (sseReconnectTimer.current) clearTimeout(sseReconnectTimer.current);
         };
-    }, [stopScreenshotPolling, startScreenshotPolling]);
+    }, [disconnectBrowserWs]);
 
-    // ── WebRTC ────────────────────────────────────────────────────────────────
+    // ── WebRTC ────────────────────────────────────────────────────────────
     const sendIceCandidates = useCallback(async (candidates: RTCIceCandidate[], pcId: string) => {
         if (!candidates.length) return;
         await fetch('/offer', {
@@ -152,23 +223,19 @@ export default function App() {
         }).catch(console.warn);
     }, []);
 
-    // ── Disconnect ────────────────────────────────────────────────────────────
+    // ── Disconnect ────────────────────────────────────────────────────────
     const disconnect = useCallback(() => {
-        console.log('[Disconnect] Stopping connection...');
         disconnectedRef.current = true;
 
-        // Stop mic tracks
         mediaStreamRef.current?.getTracks().forEach(t => t.stop());
         mediaStreamRef.current = null;
 
-        // Stop remote audio
         if (remoteAudioRef.current) {
             remoteAudioRef.current.pause();
             remoteAudioRef.current.srcObject = null;
             remoteAudioRef.current = null;
         }
 
-        // Close peer connection
         const pc = pcRef.current;
         if (pc) {
             pc.ontrack = null;
@@ -179,7 +246,6 @@ export default function App() {
         pcRef.current = null;
         pcIdRef.current = null;
 
-        // Close SSE and cancel reconnect timer
         if (eventSourceRef.current) {
             eventSourceRef.current.close();
             eventSourceRef.current = null;
@@ -189,33 +255,26 @@ export default function App() {
             sseReconnectTimer.current = null;
         }
 
-        // Reset ALL UI state
+        // Don't disconnect browser WS — keep browser view alive after voice ends
         setStatus('idle');
         setIsMuted(false);
-        setIsBrowserActive(false);
-        setScreenshotUrl(prev => {
-            if (prev) URL.revokeObjectURL(prev);
-            return null;
-        });
-        setBrowserStatus('Chờ yêu cầu tìm kiếm...');
-        console.log('[Disconnect] Done');
+        setBrowserStatus('Waiting for search request...');
     }, []);
 
-    // ── Start ─────────────────────────────────────────────────────────────────
+    // ── Start ─────────────────────────────────────────────────────────────
     const startInteraction = async () => {
         try {
-            disconnectedRef.current = false; // allow SSE & screenshot activation
+            disconnectedRef.current = false;
             setStatus('connecting');
             setChatHistory([]);
             setBookingParams({});
             setIsBrowserActive(false);
-            setScreenshotUrl(null);
-            setBrowserStatus('Chờ yêu cầu tìm kiếm...');
+            setBrowserStatus('Waiting for search request...');
             setIsMuted(false);
+            setHasBrowserFrame(false);
 
-            // Reconnect SSE
             connectSSE();
-            startScreenshotPolling();
+            // Browser WS will connect when tool_called SSE event is received
 
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             mediaStreamRef.current = stream;
@@ -242,7 +301,6 @@ export default function App() {
 
             pc.onconnectionstatechange = () => {
                 const state = pc.connectionState;
-                console.log('[WebRTC] Connection state:', state);
                 if (state === 'connected') setStatus('connected');
                 else if (state === 'failed') disconnect();
             };
@@ -273,7 +331,7 @@ export default function App() {
         }
     };
 
-    // ── Mute toggle ───────────────────────────────────────────────────────────
+    // ── Mute toggle ───────────────────────────────────────────────────────
     const toggleMute = () => {
         const stream = mediaStreamRef.current;
         if (!stream) return;
@@ -281,51 +339,6 @@ export default function App() {
         if (!audioTrack) return;
         audioTrack.enabled = !audioTrack.enabled;
         setIsMuted(!audioTrack.enabled);
-        console.log('[Mute]', audioTrack.enabled ? 'Unmuted' : 'Muted');
-    };
-
-    // ── Browser interaction helpers ───────────────────────────────────────────
-    const sendBrowserAction = async (action: string, payload: Record<string, unknown>) => {
-        try {
-            await fetch('/api/browser-interact', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action, ...payload }),
-            });
-        } catch (e) {
-            console.warn('[Browser Interact]', e);
-        }
-    };
-
-    const handleBrowserClick = (e: React.MouseEvent<HTMLImageElement>) => {
-        const img = screenshotImgRef.current;
-        if (!img) return;
-        const rect = img.getBoundingClientRect();
-        // Map click position to the actual browser viewport (1280x800)
-        const scaleX = 1280 / rect.width;
-        const scaleY = 800 / rect.height;
-        const x = Math.round((e.clientX - rect.left) * scaleX);
-        const y = Math.round((e.clientY - rect.top) * scaleY);
-        console.log(`[Browser Click] (${x}, ${y})`);
-        sendBrowserAction('click', { x, y });
-    };
-
-    const handleBrowserScroll = (e: React.WheelEvent<HTMLImageElement>) => {
-        e.preventDefault();
-        const deltaY = Math.round(e.deltaY);
-        console.log(`[Browser Scroll] deltaY=${deltaY}`);
-        sendBrowserAction('scroll', { x: 640, y: 400, deltaX: 0, deltaY });
-    };
-
-    const handleBrowserKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-        const specialKeys = ['Enter', 'Tab', 'Escape', 'Backspace', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Delete', 'Home', 'End', 'PageUp', 'PageDown'];
-        if (specialKeys.includes(e.key)) {
-            e.preventDefault();
-            sendBrowserAction('keypress', { key: e.key });
-        } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            e.preventDefault();
-            sendBrowserAction('type', { text: e.key });
-        }
     };
 
     const formatDate = (d?: string) => {
@@ -362,9 +375,8 @@ export default function App() {
                     <p style={{ fontSize: 11, color: '#475569', margin: '4px 0 0' }}>Powered by Amazon Nova Sonic</p>
                 </div>
 
-                {/* Mic + Mute buttons row */}
+                {/* Mic + Mute buttons */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                    {/* Main start/stop button */}
                     <div style={{ position: 'relative', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
                         {status === 'connected' && (
                             <div style={{
@@ -394,15 +406,14 @@ export default function App() {
                             }}
                         >
                             <span style={{ fontSize: 24 }}>{status === 'connected' ? '🔴' : status === 'connecting' ? '⏳' : '🎙️'}</span>
-                            <span>{status === 'connected' ? 'Ngắt' : status === 'connecting' ? 'Đang kết...' : 'Bắt Đầu'}</span>
+                            <span>{status === 'connected' ? 'Stop' : status === 'connecting' ? 'Connecting...' : 'Start'}</span>
                         </button>
                     </div>
 
-                    {/* Mute button (only visible when connected) */}
                     {status === 'connected' && (
                         <button
                             onClick={toggleMute}
-                            title={isMuted ? 'Bật mic' : 'Tắt mic'}
+                            title={isMuted ? 'Unmute' : 'Mute'}
                             style={{
                                 width: 48, height: 48, borderRadius: '50%', border: 'none',
                                 cursor: 'pointer',
@@ -433,17 +444,17 @@ export default function App() {
                         boxShadow: status === 'connected' ? `0 0 8px ${isMuted ? '#f59e0b' : '#10b981'}` : undefined,
                     }} />
                     {status === 'connected'
-                        ? (isMuted ? 'Mic tắt — Nhấn 🔊 để bật' : 'Đang kết nối — Hãy nói chuyện')
-                        : status === 'connecting' ? 'Đang kết nối...' : 'Sẵn sàng'}
+                        ? (isMuted ? 'Muted — Press 🔊 to unmute' : 'Connected — Start speaking')
+                        : status === 'connecting' ? 'Connecting...' : 'Ready'}
                 </div>
 
-                {/* Extracted params summary */}
+                {/* Extracted params */}
                 <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
                     {[
-                        { label: '📍 Điểm đến', val: bookingParams.destination },
-                        { label: '📅 Nhận phòng', val: formatDate(bookingParams.checkin_date) },
-                        { label: '📅 Trả phòng', val: formatDate(bookingParams.checkout_date) },
-                        { label: '👥 Người lớn', val: bookingParams.adults != null ? `${bookingParams.adults} người` : undefined },
+                        { label: '📍 Destination', val: bookingParams.destination },
+                        { label: '📅 Check-in', val: formatDate(bookingParams.checkin_date) },
+                        { label: '📅 Check-out', val: formatDate(bookingParams.checkout_date) },
+                        { label: '👥 Adults', val: bookingParams.adults != null ? `${bookingParams.adults}` : undefined },
                     ].map(({ label, val }) => (
                         <div key={label} style={{
                             display: 'flex', justifyContent: 'space-between', alignItems: 'center',
@@ -468,7 +479,7 @@ export default function App() {
                                 }} />
                             </div>
                             <div style={{ fontSize: 10, color: '#475569', marginTop: 4, textAlign: 'right' }}>
-                                {filledCount}/4 thông tin
+                                {filledCount}/4
                             </div>
                         </div>
                     )}
@@ -480,7 +491,7 @@ export default function App() {
                         background: 'rgba(99,102,241,0.07)', border: '1px solid rgba(99,102,241,0.18)',
                         borderRadius: 10, padding: '12px 14px', fontSize: 11, color: '#64748b', lineHeight: 1.6,
                     }}>
-                        <p style={{ margin: '0 0 6px', fontWeight: 600, color: '#818cf8' }}>💡 Ví dụ</p>
+                        <p style={{ margin: '0 0 6px', fontWeight: 600, color: '#818cf8' }}>💡 Example phrase</p>
                         <p style={{ margin: 0, fontStyle: 'italic', color: '#6366f1' }}>
                             "Find a hotel in Paris, check in March 1st, check out March 3rd, 2 adults"
                         </p>
@@ -491,7 +502,7 @@ export default function App() {
             {/* ── RIGHT (70%) — Browser View ── */}
             <div style={{ width: '70%', display: 'flex', flexDirection: 'column', background: '#090915' }}>
 
-                {/* Chat strip on top */}
+                {/* Chat strip */}
                 <div style={{
                     height: 180, borderBottom: '1px solid rgba(99,102,241,0.12)',
                     overflowY: 'auto', padding: '12px 20px', display: 'flex', flexDirection: 'column', gap: 8,
@@ -499,7 +510,7 @@ export default function App() {
                 }}>
                     {chatHistory.length === 0 ? (
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#1e293b', fontSize: 13 }}>
-                            💬 Lịch sử hội thoại sẽ hiện ở đây
+                            💬 Conversation will appear here
                         </div>
                     ) : chatHistory.map((msg, i) => (
                         <div key={i} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
@@ -524,7 +535,7 @@ export default function App() {
                 {/* Browser viewport */}
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
 
-                    {/* Status bar — only when browser is active */}
+                    {/* Status bar */}
                     {isBrowserActive && (
                         <div style={{
                             padding: '10px 20px', display: 'flex', alignItems: 'center', gap: 10,
@@ -533,36 +544,35 @@ export default function App() {
                         }}>
                             <div style={{
                                 width: 8, height: 8, borderRadius: '50%',
-                                background: '#f59e0b',
-                                boxShadow: '0 0 8px #f59e0b',
+                                background: hasBrowserFrame ? '#10b981' : '#f59e0b',
+                                boxShadow: `0 0 8px ${hasBrowserFrame ? '#10b981' : '#f59e0b'}`,
                                 animation: 'pulse 1.2s ease-in-out infinite',
                             }} />
                             <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#475569' }}>
                                 🌐 https://www.booking.com
                             </span>
-                            <span style={{ marginLeft: 'auto' }}>{browserStatus}</span>
+                            <span style={{ marginLeft: 'auto', color: hasBrowserFrame ? '#10b981' : '#f59e0b' }}>{browserStatus}</span>
                             <span style={{ fontSize: 10, color: '#475569', marginLeft: 8 }}>
-                                💡 Click / cuộn / gõ phím để tương tác
+                                🖱️ Click / scroll / type to interact
                             </span>
                         </div>
                     )}
 
-                    {/* Screenshot display / Interactive browser */}
-                    <div
-                        style={{ flex: 1, overflow: 'hidden', position: 'relative', background: '#060611', outline: 'none' }}
-                        tabIndex={0}
-                        onKeyDown={isBrowserActive && screenshotUrl ? handleBrowserKeyDown : undefined}
-                    >
-                        {isBrowserActive && screenshotUrl ? (
-                            <img
-                                ref={screenshotImgRef}
-                                src={screenshotUrl}
-                                alt="Live browser view — click to interact"
-                                onClick={handleBrowserClick}
-                                onWheel={handleBrowserScroll}
+                    {/* Canvas (CDP screencast) or placeholder */}
+                    <div style={{ flex: 1, overflow: 'hidden', position: 'relative', background: '#060611' }}>
+                        {isBrowserActive ? (
+                            <canvas
+                                ref={canvasRef}
+                                width={1280}
+                                height={800}
+                                tabIndex={0}
+                                onClick={handleCanvasClick}
+                                onWheel={handleCanvasScroll}
+                                onKeyDown={handleCanvasKeyDown}
                                 style={{
                                     width: '100%', height: '100%', objectFit: 'contain',
-                                    display: 'block', cursor: 'pointer',
+                                    display: 'block', cursor: 'pointer', outline: 'none',
+                                    background: '#0a0a1a',
                                 }}
                             />
                         ) : (
@@ -573,26 +583,27 @@ export default function App() {
                                 <div style={{ fontSize: 56, opacity: 0.15 }}>🌐</div>
                                 <p style={{ margin: 0, fontSize: 14, color: '#1e293b' }}>
                                     {status === 'connected'
-                                        ? 'Hãy nói để bắt đầu tìm kiếm khách sạn'
-                                        : 'Kết nối để bắt đầu'}
+                                        ? 'Speak to start searching for hotels'
+                                        : 'Connect to start'}
                                 </p>
                                 {status !== 'connected' && (
                                     <p style={{ margin: 0, fontSize: 11, color: '#0f172a' }}>
-                                        Trình duyệt sẽ tự động mở khi bot tìm kiếm
+                                        Browser will open automatically when the bot searches
                                     </p>
                                 )}
                             </div>
                         )}
 
-                        {/* Searching overlay */}
-                        {isBrowserActive && !screenshotUrl && (
+                        {/* Loading overlay (browser active but no frame yet) */}
+                        {isBrowserActive && !hasBrowserFrame && (
                             <div style={{
                                 position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
                                 alignItems: 'center', justifyContent: 'center', gap: 12,
-                                background: 'rgba(0,0,0,0.4)',
+                                background: 'rgba(0,0,0,0.6)',
                             }}>
                                 <div style={{ fontSize: 32, animation: 'spin 1s linear infinite' }}>⚙️</div>
-                                <p style={{ margin: 0, fontSize: 14, color: '#f59e0b' }}>Đang tải Booking.com...</p>
+                                <p style={{ margin: 0, fontSize: 14, color: '#f59e0b' }}>Connecting to browser...</p>
+                                <p style={{ margin: 0, fontSize: 11, color: '#475569' }}>CDP Screencast streaming</p>
                             </div>
                         )}
                     </div>
