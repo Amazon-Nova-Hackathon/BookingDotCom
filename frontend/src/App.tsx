@@ -24,6 +24,8 @@ export default function App() {
 
     const pcRef = useRef<RTCPeerConnection | null>(null);
     const pcIdRef = useRef<string | null>(null);
+    const mediaStreamRef = useRef<MediaStream | null>(null);
+    const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const eventSourceRef = useRef<EventSource | null>(null);
     const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -35,19 +37,24 @@ export default function App() {
     // ── Screenshot polling ─────────────────────────────────────────────────────
     const startScreenshotPolling = useCallback(() => {
         if (pollIntervalRef.current) return;
+        console.log('[Browser] Starting screenshot polling');
         pollIntervalRef.current = setInterval(async () => {
             try {
-                const res = await fetch('http://localhost:7863/screenshot', { cache: 'no-store' });
-                if (res.status === 200) {
+                const res = await fetch('/api/screenshot', { cache: 'no-store' });
+                if (res.status === 200 && res.headers.get('content-type')?.includes('image')) {
                     const blob = await res.blob();
-                    const url = URL.createObjectURL(blob);
-                    setScreenshotUrl(prev => {
-                        if (prev) URL.revokeObjectURL(prev);
-                        return url;
-                    });
+                    if (blob.size > 100) {  // real screenshot, not empty
+                        const url = URL.createObjectURL(blob);
+                        setScreenshotUrl(prev => {
+                            if (prev) URL.revokeObjectURL(prev);
+                            return url;
+                        });
+                        // Auto-activate browser view when screenshots arrive
+                        setIsBrowserActive(true);
+                    }
                 }
             } catch { /* browser service not running */ }
-        }, 400);
+        }, 500);
     }, []);
 
     const stopScreenshotPolling = useCallback(() => {
@@ -60,12 +67,18 @@ export default function App() {
     // ── SSE ───────────────────────────────────────────────────────────────────
     const connectSSE = useCallback(() => {
         if (eventSourceRef.current) return;
-        const es = new EventSource('http://localhost:7860/events');
+        console.log('[SSE] Connecting to /api/events...');
+        const es = new EventSource('/api/events');
         eventSourceRef.current = es;
+
+        es.onopen = () => {
+            console.log('[SSE] Connected successfully');
+        };
 
         es.onmessage = (evt) => {
             try {
                 const data = JSON.parse(evt.data);
+                console.log('[SSE] Event received:', data.type, data);
                 switch (data.type) {
                     case 'user_transcript':
                         setChatHistory(h => [...h, { role: 'user', text: data.text }]);
@@ -80,39 +93,41 @@ export default function App() {
                         });
                         break;
                     case 'tool_called':
+                        console.log('[SSE] Tool called! Starting browser view...');
                         setBookingParams(data.args ?? {});
                         setIsBrowserActive(true);
                         setBrowserStatus('🤖 Đang thao tác trên Booking.com...');
-                        startScreenshotPolling();
                         break;
                     case 'tool_result':
-                        setIsBrowserActive(false);
+                        console.log('[SSE] Tool result received');
                         setBrowserStatus(data.error ? '❌ Tìm kiếm thất bại' : '✅ Tìm kiếm hoàn tất');
-                        stopScreenshotPolling();
                         break;
                 }
             } catch { }
         };
 
-        es.onerror = () => {
+        es.onerror = (err) => {
+            console.log('[SSE] Error, will reconnect in 2s', err);
             es.close();
             eventSourceRef.current = null;
             setTimeout(connectSSE, 2000);
         };
-    }, [startScreenshotPolling, stopScreenshotPolling]);
+    }, []);
 
     useEffect(() => {
         connectSSE();
+        // Start screenshot polling immediately — always poll while app is open
+        startScreenshotPolling();
         return () => {
             eventSourceRef.current?.close();
             stopScreenshotPolling();
         };
-    }, [connectSSE, stopScreenshotPolling]);
+    }, [connectSSE, stopScreenshotPolling, startScreenshotPolling]);
 
     // ── WebRTC ────────────────────────────────────────────────────────────────
     const sendIceCandidates = useCallback(async (candidates: RTCIceCandidate[], pcId: string) => {
         if (!candidates.length) return;
-        await fetch('http://localhost:7860/offer', {
+        await fetch('/offer', {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -136,6 +151,7 @@ export default function App() {
             setBrowserStatus('Chờ yêu cầu tìm kiếm...');
 
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaStreamRef.current = stream;
             const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
             pcRef.current = pc;
 
@@ -150,6 +166,7 @@ export default function App() {
                 const audio = new Audio();
                 audio.srcObject = e.streams[0];
                 audio.play().catch(console.error);
+                remoteAudioRef.current = audio;
             };
 
             pc.onconnectionstatechange = () => {
@@ -162,7 +179,7 @@ export default function App() {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
 
-            const res = await fetch('http://localhost:7860/offer', {
+            const res = await fetch('/offer', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
@@ -184,10 +201,19 @@ export default function App() {
     };
 
     const disconnect = () => {
+        // Stop all mic tracks
+        mediaStreamRef.current?.getTracks().forEach(t => t.stop());
+        mediaStreamRef.current = null;
+        // Stop remote audio playback
+        if (remoteAudioRef.current) {
+            remoteAudioRef.current.pause();
+            remoteAudioRef.current.srcObject = null;
+            remoteAudioRef.current = null;
+        }
+        // Close peer connection
         pcRef.current?.close();
         pcRef.current = null;
         pcIdRef.current = null;
-        stopScreenshotPolling();
         setStatus('idle');
     };
 

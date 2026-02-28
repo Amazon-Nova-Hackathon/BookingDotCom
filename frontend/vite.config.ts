@@ -22,6 +22,14 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
+      '/events': {
+        target: 'http://127.0.0.1:7860',
+        changeOrigin: true,
+      },
+      '/screenshot': {
+        target: 'http://127.0.0.1:7860',
+        changeOrigin: true,
+      },
       '/health': {
         target: 'http://127.0.0.1:7860',
         changeOrigin: true,

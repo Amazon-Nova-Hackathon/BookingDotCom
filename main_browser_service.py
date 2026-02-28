@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from src.playwright_agent import booking_agent
+from src.browser_agent import booking_agent
 
 load_dotenv(override=True)
 
@@ -98,7 +98,7 @@ app = web.Application(middlewares=[cors_middleware])
 app.add_routes(routes)
 
 if __name__ == "__main__":
-    PORT = int(os.getenv("PORT", "7863"))
+    PORT = int(os.getenv("BROWSER_PORT", "7863"))
     HOST = os.getenv("HOST", "0.0.0.0")
     logger.info(f"Starting Browser Agent Service on {HOST}:{PORT}")
     web.run_app(app, host=HOST, port=PORT)

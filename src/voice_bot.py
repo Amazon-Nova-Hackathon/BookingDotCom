@@ -115,11 +115,13 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
     logger.info(f"Starting pipeline for pc_id: {webrtc_connection.pc_id}")
 
     # --- Nova Sonic LLM ---
+    nova_region = os.getenv("NOVA_SONIC_REGION", "us-east-1")
+    logger.info(f"Nova Sonic region: {nova_region}, model: {os.getenv('NOVA_SONIC_MODEL_ID', 'amazon.nova-2-sonic-v1:0')}")
     llm = AWSNovaSonicLLMService(
-        model=os.getenv("BEDROCK_MODEL_ID", "amazon.nova-2-sonic-v1:0"),
+        model=os.getenv("NOVA_SONIC_MODEL_ID", "amazon.nova-2-sonic-v1:0"),
         access_key_id=os.getenv("AWS_ACCESS_KEY_ID", ""),
         secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", ""),
-        region=os.getenv("AWS_REGION", os.getenv("BEDROCK_REGION", "us-east-1")),
+        region=nova_region,
         session_token=os.getenv("AWS_SESSION_TOKEN") or None,
         system_instruction=SYSTEM_PROMPT,  # pass directly → no need to wait for LLMContextFrame
         params=NovaSonicParams(),
@@ -268,6 +270,26 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+async def handle_screenshot(request: web.Request) -> web.Response:
+    """Proxy screenshots from browser service so frontend only needs to talk to one port."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{BROWSER_SERVICE_URL}/screenshot",
+                timeout=aiohttp.ClientTimeout(total=3),
+            ) as resp:
+                if resp.status == 204:
+                    return web.Response(status=204)
+                body = await resp.read()
+                return web.Response(
+                    body=body,
+                    content_type="image/png",
+                    headers={"Cache-Control": "no-cache"},
+                )
+    except Exception:
+        return web.Response(status=204)
+
+
 async def handle_events(request: web.Request) -> web.StreamResponse:
     """
     Endpoint: GET /events
@@ -315,6 +337,7 @@ def create_app():
     app.router.add_post("/offer", handle_offer)
     app.router.add_patch("/offer", handle_ice)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/screenshot", handle_screenshot)  # Proxy from browser service
     app.router.add_get("/events", handle_events)   # SSE stream
 
     return app
