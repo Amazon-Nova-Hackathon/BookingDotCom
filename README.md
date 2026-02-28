@@ -22,7 +22,7 @@ This project enables voice-based hotel booking using AWS Nova Sonic 2 S2S for sp
 3. Start backend services:
    ```sh
    python main_voice.py
-   python main_browser_service.py
+   python main_browser_service.py (new terminal still venv)
    ```
 4. Start the frontend:
    ```sh

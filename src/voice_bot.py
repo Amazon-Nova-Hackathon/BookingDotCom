@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import os
+import time
 import uuid
 from loguru import logger
 import aiohttp
@@ -41,6 +42,21 @@ import json
 load_dotenv(override=True)
 
 BROWSER_SERVICE_URL = os.getenv("BROWSER_SERVICE_URL", "http://localhost:7863")
+
+# Shared aiohttp session for browser service proxying (reused across requests)
+_http_session: aiohttp.ClientSession | None = None
+
+# Screenshot cache to avoid hammering browser service
+_screenshot_cache: bytes | None = None
+_screenshot_cache_time: float = 0.0
+_SCREENSHOT_CACHE_TTL = 0.3  # serve cached screenshot for 300ms
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Get or create the shared aiohttp session."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
 
 # Global WebRTC request handler (manages all peer connections)
 webrtc_handler = SmallWebRTCRequestHandler(
@@ -271,23 +287,60 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_screenshot(request: web.Request) -> web.Response:
-    """Proxy screenshots from browser service so frontend only needs to talk to one port."""
+    """Proxy screenshots from browser service with caching to reduce load."""
+    global _screenshot_cache, _screenshot_cache_time
+    now = time.monotonic()
+
+    # Serve cached screenshot if still fresh
+    if _screenshot_cache and (now - _screenshot_cache_time) < _SCREENSHOT_CACHE_TTL:
+        return web.Response(
+            body=_screenshot_cache,
+            content_type="image/png",
+            headers={"Cache-Control": "no-cache"},
+        )
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{BROWSER_SERVICE_URL}/screenshot",
-                timeout=aiohttp.ClientTimeout(total=3),
-            ) as resp:
-                if resp.status == 204:
-                    return web.Response(status=204)
-                body = await resp.read()
-                return web.Response(
-                    body=body,
-                    content_type="image/png",
-                    headers={"Cache-Control": "no-cache"},
-                )
+        session = await get_http_session()
+        async with session.get(
+            f"{BROWSER_SERVICE_URL}/screenshot",
+            timeout=aiohttp.ClientTimeout(total=3),
+        ) as resp:
+            if resp.status == 204:
+                return web.Response(status=204)
+            body = await resp.read()
+            # Cache it
+            _screenshot_cache = body
+            _screenshot_cache_time = now
+            return web.Response(
+                body=body,
+                content_type="image/png",
+                headers={"Cache-Control": "no-cache"},
+            )
     except Exception:
+        # Return cached if available, else 204
+        if _screenshot_cache:
+            return web.Response(
+                body=_screenshot_cache,
+                content_type="image/png",
+                headers={"Cache-Control": "no-cache"},
+            )
         return web.Response(status=204)
+
+
+async def handle_browser_interact(request: web.Request) -> web.Response:
+    """Proxy user browser interactions (click/scroll/type) to browser service."""
+    try:
+        data = await request.json()
+        session = await get_http_session()
+        async with session.post(
+            f"{BROWSER_SERVICE_URL}/api/interact",
+            json=data,
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            body = await resp.json()
+            return web.json_response(body, status=resp.status)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
 async def handle_events(request: web.Request) -> web.StreamResponse:
@@ -323,6 +376,14 @@ async def handle_events(request: web.Request) -> web.StreamResponse:
 def create_app():
     app = web.Application()
 
+    async def cleanup(app):
+        global _http_session
+        if _http_session and not _http_session.closed:
+            await _http_session.close()
+            _http_session = None
+
+    app.on_cleanup.append(cleanup)
+
     # Serve built React frontend
     frontend_path = os.path.join(
         os.path.dirname(os.path.dirname(__file__)), "frontend", "dist"
@@ -338,6 +399,7 @@ def create_app():
     app.router.add_patch("/offer", handle_ice)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/screenshot", handle_screenshot)  # Proxy from browser service
+    app.router.add_post("/browser-interact", handle_browser_interact)  # Proxy interactions
     app.router.add_get("/events", handle_events)   # SSE stream
 
     return app

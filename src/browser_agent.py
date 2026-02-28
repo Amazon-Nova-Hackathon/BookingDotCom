@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Browser Agent - Booking.com Automation
-Uses browser-use with AWS Bedrock and Playwright
-to automate hotel search on Booking.com with live screenshot streaming.
+Uses browser-use BrowserSession (Playwright) for live browser view,
+with direct Playwright automation for fast hotel search.
 """
 import asyncio
 import base64
 import os
+import re
 import sys
 import traceback
 
@@ -20,23 +21,19 @@ _browser_use_path = os.path.join(os.path.dirname(__file__), "..", "..", "browser
 if os.path.isdir(_browser_use_path) and _browser_use_path not in sys.path:
     sys.path.insert(0, os.path.abspath(_browser_use_path))
 
-from browser_use import Agent, BrowserSession, BrowserProfile
-from browser_use.llm.aws import ChatAWSBedrock
+from browser_use import BrowserSession, BrowserProfile
 
 
 class BrowserAgentHandler:
     """
-    Manages a browser-use Agent that autonomously navigates Booking.com.
-    Creates a fresh BrowserSession per task (Agent kills sessions after run).
+    Manages a BrowserSession and drives Playwright directly for fast hotel search.
     Caches the latest screenshot (PNG bytes) so the frontend can poll it.
     """
 
     def __init__(self):
-        self.llm: ChatAWSBedrock | None = None
         self._latest_screenshot: bytes | None = None
         self._screenshot_task: asyncio.Task | None = None
         self._current_session: BrowserSession | None = None
-        self._llm_ready = False
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -46,10 +43,9 @@ class BrowserAgentHandler:
 
     async def execute_action(self, action: str, params: dict, session_id: str = "") -> dict:
         """Entry point called by main_browser_service."""
-        self._ensure_llm()
         try:
             if action == "search_hotel":
-                return await self._run_agent_task(params, session_id)
+                return await self._run_direct_search(params, session_id)
             else:
                 return {"success": False, "error": f"Unknown action: {action}"}
         except Exception as e:
@@ -58,25 +54,8 @@ class BrowserAgentHandler:
 
     # ── internals ───────────────────────────────────────────────────────────
 
-    def _ensure_llm(self):
-        """One-time LLM init from .env vars."""
-        if self._llm_ready:
-            return
-
-        logger.info("Initializing ChatAWSBedrock LLM …")
-        self.llm = ChatAWSBedrock(
-            model=os.getenv("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-6"),
-            aws_access_key_id=os.getenv("BEDROCK_ACCESS_KEY_ID", os.getenv("AWS_ACCESS_KEY_ID")),
-            aws_secret_access_key=os.getenv("BEDROCK_SECRET_ACCESS_KEY", os.getenv("AWS_SECRET_ACCESS_KEY")),
-            aws_region=os.getenv("BEDROCK_REGION", "ap-southeast-1"),
-            aws_session_token=os.getenv("BEDROCK_SESSION_TOKEN", os.getenv("AWS_SESSION_TOKEN")),
-            max_tokens=4096,
-        )
-        self._llm_ready = True
-        logger.info("LLM ready.")
-
     def _create_session(self) -> BrowserSession:
-        """Create a fresh BrowserSession each time (Agent kills it after run)."""
+        """Create a fresh BrowserSession each time."""
         profile = BrowserProfile(
             headless=True,
             viewport={"width": 1280, "height": 800},
@@ -102,71 +81,213 @@ class BrowserAgentHandler:
                 pass  # page may not be ready yet
             await asyncio.sleep(0.4)
 
-    async def _on_step(self, browser_state, model_output, step_number):
-        """Callback fired after every Agent LLM step — grab screenshot from state."""
-        try:
-            if browser_state and browser_state.screenshot:
-                self._latest_screenshot = base64.b64decode(browser_state.screenshot)
-                logger.info(f"Step {step_number}: screenshot cached ({len(self._latest_screenshot)} bytes)")
-        except Exception as e:
-            logger.warning(f"Step callback screenshot error: {e}")
+    async def _run_direct_search(self, params: dict, session_id: str) -> dict:
+        """
+        Navigate directly to Booking.com search results URL and extract hotel data.
+        Uses browser-use CDP Page API (NOT Playwright).
+        """
+        import json as _json
+        from urllib.parse import quote_plus
 
-    async def _run_agent_task(self, params: dict, session_id: str) -> dict:
-        """Build a task string from params and let browser-use Agent solve it."""
         destination = params.get("destination", "")
         checkin = params.get("checkin_date", "")
         checkout = params.get("checkout_date", "")
         adults = params.get("adults", 2)
 
-        task = (
-            f"Go to https://www.booking.com and search for hotels.\n"
-            f"Destination: {destination}\n"
-        )
-        if checkin:
-            task += f"Check-in date: {checkin}\n"
-        if checkout:
-            task += f"Check-out date: {checkout}\n"
-        task += (
-            f"Number of adults: {adults}\n"
-            f"After the search results load, extract the name and price of the first hotel "
-            f"and return them."
-        )
+        logger.info(f"[{session_id}] Direct search: dest={destination}, "
+                     f"checkin={checkin}, checkout={checkout}, adults={adults}")
 
-        logger.info(f"[{session_id}] Running browser-use agent: {task[:120]}…")
+        # Kill previous session if any
+        if self._current_session:
+            try:
+                await self._current_session.kill()
+            except Exception:
+                pass
 
-        # Fresh session per task — Agent kills it when done
+        # Fresh session per task
         session = self._create_session()
         self._current_session = session
         self._latest_screenshot = None
 
-        # Start background screenshot polling for this session
+        # Start background screenshot polling
         screenshot_task = asyncio.create_task(self._screenshot_loop(session))
 
         try:
-            agent = Agent(
-                task=task,
-                llm=self.llm,
-                browser_session=session,
-                register_new_step_callback=self._on_step,
-                use_vision=True,
-                max_actions_per_step=3,
-                max_failures=3,
+            # Start the browser session
+            await session.start()
+
+            page = await session.get_current_page()
+            if not page:
+                return {"success": False, "error": "Failed to get browser page"}
+
+            # ── Step 1: Navigate directly to search results URL ──
+            encoded_dest = quote_plus(destination)
+            search_url = (
+                f"https://www.booking.com/searchresults.html"
+                f"?ss={encoded_dest}"
+                f"&checkin={checkin}"
+                f"&checkout={checkout}"
+                f"&group_adults={adults}"
+                f"&no_rooms=1"
+                f"&selected_currency=USD"
             )
+            logger.info(f"[{session_id}] Navigating to: {search_url}")
+            await page.goto(search_url)
 
-            result = await agent.run(max_steps=15)
+            # Wait for page to load (no wait_for_selector in CDP API)
+            logger.info(f"[{session_id}] Waiting for search results to load...")
+            await asyncio.sleep(8)
 
-            # Extract final result text
-            final_text = result.final_result() if result.final_result() else "Search completed but no result text."
-            logger.info(f"[{session_id}] Agent finished: {final_text[:200]}")
+            # ── Step 2: Dismiss any popups via JS ──
+            try:
+                await page.evaluate("""
+                    () => {
+                        const dismiss = document.querySelector('[aria-label="Dismiss sign-in info."]');
+                        if (dismiss) dismiss.click();
+                        const cookie = document.querySelector('#onetrust-accept-btn-handler');
+                        if (cookie) cookie.click();
+                    }
+                """)
+                await asyncio.sleep(1)
+            except Exception:
+                pass
 
-            return {"success": True, "result": final_text}
+            # ── Step 3: Poll for property cards (up to 20s) ──
+            hotel_data = None
+            for attempt in range(10):
+                logger.info(f"[{session_id}] Extraction attempt {attempt + 1}...")
+                raw = await page.evaluate("""
+                    () => {
+                        const hotels = [];
+                        const cards = document.querySelectorAll('[data-testid="property-card"]');
+                        for (let i = 0; i < Math.min(cards.length, 5); i++) {
+                            const card = cards[i];
+                            const nameEl = card.querySelector('[data-testid="title"]');
+                            const priceEl = card.querySelector('[data-testid="price-and-discounted-price"]');
+                            const ratingEl = card.querySelector('[data-testid="review-score"]');
+                            const name = nameEl ? nameEl.textContent.trim() : 'Unknown';
+                            const price = priceEl ? priceEl.textContent.trim() : 'Price not shown';
+                            const rating = ratingEl ? ratingEl.textContent.trim() : '';
+                            hotels.push({ name, price, rating });
+                        }
+                        return JSON.stringify(hotels);
+                    }
+                """)
+                try:
+                    parsed = _json.loads(raw) if isinstance(raw, str) else raw
+                    if parsed and len(parsed) > 0:
+                        hotel_data = parsed
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+            if hotel_data and len(hotel_data) > 0:
+                lines = []
+                for i, h in enumerate(hotel_data, 1):
+                    line = f"{i}. {h['name']}"
+                    if h.get('rating'):
+                        line += f" ({h['rating']})"
+                    line += f" - {h['price']}"
+                    lines.append(line)
+
+                result_text = "Here are the top hotels I found:\n" + "\n".join(lines)
+                logger.info(f"[{session_id}] Found {len(hotel_data)} hotels")
+                return {"success": True, "result": result_text}
+            else:
+                # Fallback: try getting any title elements
+                raw_titles = await page.evaluate("""
+                    () => {
+                        const els = document.querySelectorAll('[data-testid="title"]');
+                        return JSON.stringify(Array.from(els).slice(0, 5).map(e => e.textContent.trim()));
+                    }
+                """)
+                try:
+                    titles = _json.loads(raw_titles) if isinstance(raw_titles, str) else raw_titles
+                    if titles and len(titles) > 0:
+                        result_text = "Hotels found: " + ", ".join(titles)
+                        return {"success": True, "result": result_text}
+                except Exception:
+                    pass
+
+                # Last resort: get page title to debug
+                try:
+                    title = await page.get_title()
+                    url = await page.get_url()
+                    logger.warning(f"[{session_id}] No hotels extracted. Page: {title} | URL: {url}")
+                except Exception:
+                    pass
+
+                return {"success": True, "result": "Search completed. Please check the browser view for results."}
+
+        except Exception as e:
+            logger.error(f"[{session_id}] Direct search error: {e}\n{traceback.format_exc()}")
+            return {"success": False, "error": str(e)}
         finally:
             screenshot_task.cancel()
             try:
                 await screenshot_task
             except asyncio.CancelledError:
                 pass
-            self._current_session = None
+            # Keep session alive for user interaction (don't kill it)
+
+    # ── User interaction forwarding ────────────────────────────────────────
+
+    async def user_click(self, x: int, y: int) -> bool:
+        """Forward a user click to the current browser page."""
+        try:
+            session = self._current_session
+            if session and session.is_cdp_connected:
+                page = await session.get_current_page()
+                if page:
+                    mouse = await page.mouse
+                    await mouse.click(x, y)
+                    return True
+        except Exception as e:
+            logger.warning(f"user_click error: {e}")
+        return False
+
+    async def user_scroll(self, x: int, y: int, delta_x: int, delta_y: int) -> bool:
+        """Forward a scroll event to the current browser page."""
+        try:
+            session = self._current_session
+            if session and session.is_cdp_connected:
+                page = await session.get_current_page()
+                if page:
+                    mouse = await page.mouse
+                    await mouse.scroll(x=x, y=y, delta_x=delta_x, delta_y=delta_y)
+                    return True
+        except Exception as e:
+            logger.warning(f"user_scroll error: {e}")
+        return False
+
+    async def user_type(self, text: str) -> bool:
+        """Forward keyboard input to the current browser page."""
+        try:
+            session = self._current_session
+            if session and session.is_cdp_connected:
+                page = await session.get_current_page()
+                if page:
+                    # Type each character as a key press
+                    for ch in text:
+                        await page.press(ch)
+                    return True
+        except Exception as e:
+            logger.warning(f"user_type error: {e}")
+        return False
+
+    async def user_keypress(self, key: str) -> bool:
+        """Forward a single key press (Enter, Tab, Escape, etc.)."""
+        try:
+            session = self._current_session
+            if session and session.is_cdp_connected:
+                page = await session.get_current_page()
+                if page:
+                    await page.press(key)
+                    return True
+        except Exception as e:
+            logger.warning(f"user_keypress error: {e}")
+        return False
 
     async def close(self):
         """Cleanup."""

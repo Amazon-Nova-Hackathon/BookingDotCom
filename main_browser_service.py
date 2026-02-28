@@ -9,6 +9,7 @@ import asyncio
 import os
 import sys
 import json
+import time
 import traceback
 
 from aiohttp import web
@@ -22,6 +23,11 @@ from src.browser_agent import booking_agent
 load_dotenv(override=True)
 
 routes = RouteTableDef()
+
+# Screenshot debounce: avoid calling take_screenshot more than once per 300ms
+_cached_screenshot: bytes | None = None
+_cached_screenshot_time: float = 0.0
+_SCREENSHOT_MIN_INTERVAL = 0.3
 
 
 @routes.post("/api/execute")
@@ -68,17 +74,52 @@ async def health_check(request):
 async def get_screenshot(request):
     """
     Return the latest Playwright screenshot as PNG.
-    The frontend polls this every ~400ms to get a live browser view.
+    Debounced: serves cached screenshot if called within 300ms.
     """
+    global _cached_screenshot, _cached_screenshot_time
+    now = time.monotonic()
+
     png = booking_agent.get_screenshot()
     if png is None:
-        # Return a 1x1 transparent PNG placeholder
         return web.Response(status=204)
+
+    # Only update cache if enough time has passed
+    if (now - _cached_screenshot_time) >= _SCREENSHOT_MIN_INTERVAL:
+        _cached_screenshot = png
+        _cached_screenshot_time = now
+
     return web.Response(
-        body=png,
+        body=_cached_screenshot or png,
         content_type="image/png",
         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
     )
+
+
+@routes.post("/api/interact")
+async def interact(request):
+    """Forward user mouse/keyboard interaction to the live browser."""
+    try:
+        data = await request.json()
+        action = data.get("action")
+        ok = False
+
+        if action == "click":
+            ok = await booking_agent.user_click(int(data["x"]), int(data["y"]))
+        elif action == "scroll":
+            ok = await booking_agent.user_scroll(
+                int(data.get("x", 0)), int(data.get("y", 0)),
+                int(data.get("deltaX", 0)), int(data.get("deltaY", 0)),
+            )
+        elif action == "type":
+            ok = await booking_agent.user_type(data.get("text", ""))
+        elif action == "keypress":
+            ok = await booking_agent.user_keypress(data.get("key", "Enter"))
+        else:
+            return web.json_response({"ok": False, "error": f"Unknown action: {action}"}, status=400)
+
+        return web.json_response({"ok": ok})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
 @web.middleware
