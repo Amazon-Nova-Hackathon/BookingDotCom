@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import re
 import os
 import time
 import uuid
@@ -31,6 +32,9 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.frames.frames import LLMContextFrame
 from pipecat.frames.frames import (
     Frame,
+    FunctionCallResultProperties,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
     TextFrame,
     TranscriptionFrame,
     TTSTextFrame,
@@ -47,6 +51,29 @@ BROWSER_SERVICE_URL = os.getenv("BROWSER_SERVICE_URL", "http://localhost:7863")
 
 # Shared aiohttp session for browser service proxying (reused across requests)
 _http_session: aiohttp.ClientSession | None = None
+_inflight_browser_actions: dict[str, asyncio.Task] = {}
+_recent_browser_action_results: dict[str, tuple[float, dict]] = {}
+_BROWSER_ACTION_DEDUPE_TTL = 2.0
+_READY_TOKEN_RE = re.compile(r"(?:(?<=^)|(?<=[\s,.;:!?-]))ready(?!\s+to\b)[.!?]?(?=$|[\s,.;:!?-])", re.IGNORECASE)
+_DIGIT_WORDS = {
+    "zero": "0",
+    "oh": "0",
+    "o": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+}
+_DIGIT_SEQUENCE_RE = re.compile(
+    r"(?i)\b(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine)\b"
+    r"(?:[\s,.;:\-]+\b(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine)\b){2,}"
+)
+_latest_user_transcript: str = ""
 
 # Screenshot cache to avoid hammering browser service
 _screenshot_cache: bytes | None = None
@@ -59,6 +86,31 @@ async def get_http_session() -> aiohttp.ClientSession:
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession()
     return _http_session
+
+
+def _browser_action_fingerprint(action: str, args: dict) -> str:
+    normalized_args = json.dumps(args or {}, sort_keys=True, separators=(",", ":"), default=str)
+    return f"{action}:{normalized_args}"
+
+
+def _clean_user_transcript_text(text: str) -> str:
+    def replace_digit_sequence(match: re.Match[str]) -> str:
+        words = re.findall(r"(?i)\b(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine)\b", match.group(0))
+        return "".join(_DIGIT_WORDS[word.lower()] for word in words)
+
+    cleaned = _READY_TOKEN_RE.sub(" ", text or "")
+    cleaned = _DIGIT_SEQUENCE_RE.sub(replace_digit_sequence, cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def _user_explicitly_wants_reservation() -> bool:
+    return bool(re.search(r"\b(book|booking|reserve|reservation|proceed with booking|go ahead and book)\b", _latest_user_transcript, re.IGNORECASE))
+
+
+def _user_explicitly_wants_to_continue() -> bool:
+    return bool(re.search(r"\b(continue|next|next page|go on|proceed|payment|pay|move on)\b", _latest_user_transcript, re.IGNORECASE))
 
 # Global WebRTC request handler (manages all peer connections)
 webrtc_handler = SmallWebRTCRequestHandler(
@@ -85,6 +137,7 @@ class ConversationEventLogger(FrameProcessor):
         super().__init__()
         self._capture_user = capture_user
         self._capture_bot = capture_bot
+        self._saw_llm_text_this_turn = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -95,14 +148,37 @@ class ConversationEventLogger(FrameProcessor):
             and isinstance(frame, TranscriptionFrame)
             and frame.text.strip()
         ):
-            logger.info(f"🎙️  USER  → '{frame.text}'")
-            await broadcast_event("user_transcript", {"text": frame.text})
+            cleaned_text = _clean_user_transcript_text(frame.text)
+            if cleaned_text:
+                global _latest_user_transcript
+                _latest_user_transcript = cleaned_text
+                logger.info(f"USER -> '{cleaned_text}'")
+                await broadcast_event("user_transcript", {"text": cleaned_text})
+        elif (
+            self._capture_bot
+            and direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, LLMFullResponseStartFrame)
+        ):
+            self._saw_llm_text_this_turn = False
+            await broadcast_event("bot_response_start", {})
+        elif (
+            self._capture_bot
+            and direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, LLMTextFrame)
+            and frame.text.strip()
+        ):
+            self._saw_llm_text_this_turn = True
+            logger.info(f"BOT TEXT -> '{frame.text}'")
+            await broadcast_event("bot_response", {"text": frame.text})
         elif (
             self._capture_bot
             and direction == FrameDirection.DOWNSTREAM
             and isinstance(frame, TTSTextFrame)
             and frame.text.strip()
         ):
+            if self._saw_llm_text_this_turn:
+                await self.push_frame(frame, direction)
+                return
             logger.info(f"🤖  BOT   → '{frame.text}'")
             await broadcast_event("bot_response", {"text": frame.text})
 
@@ -163,13 +239,41 @@ class ResilientAWSNovaSonicLLMService(AWSNovaSonicLLMService):
             self._disconnecting = True
             self._stream = None
 
+    async def _report_user_transcription_ended(self):
+        text = _clean_user_transcript_text((self._user_text_buffer or "").strip())
+        self._user_text_buffer = text
+
+        await super()._report_user_transcription_ended()
+
 
 async def invoke_browser_action(action: str, args: dict, result_callback):
+    fingerprint = _browser_action_fingerprint(action, args)
+    now = time.monotonic()
+    cached = _recent_browser_action_results.get(fingerprint)
+    if cached and (now - cached[0]) <= _BROWSER_ACTION_DEDUPE_TTL:
+        logger.info(f"Reusing recent result for duplicate action '{action}'.")
+        await result_callback(
+            {"duplicate_tool_call": True},
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+        return
+
+    inflight_task = _inflight_browser_actions.get(fingerprint)
+    if inflight_task:
+        logger.info(f"Joining in-flight duplicate action '{action}'.")
+        await inflight_task
+        await result_callback(
+            {"duplicate_tool_call": True},
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+        return
+
     session_id = str(uuid.uuid4())
     await broadcast_event("tool_called", {"action": action, "args": args})
 
-    try:
-        async with aiohttp.ClientSession() as session:
+    async def run_browser_request():
+        try:
+            session = await get_http_session()
             payload = {
                 "action": action,
                 "params": args,
@@ -183,17 +287,35 @@ async def invoke_browser_action(action: str, args: dict, result_callback):
                 result_json = await response.json()
                 if result_json.get("success"):
                     text_result = result_json.get("result", "Action completed.")
-                    await broadcast_event("tool_result", {"action": action, "result": text_result})
-                    await result_callback({"result": text_result})
-                else:
-                    err_msg = f"Browser agent error: {result_json.get('error', 'unknown')}"
-                    await broadcast_event("tool_result", {"action": action, "error": err_msg})
-                    await result_callback({"error": err_msg})
-    except Exception as e:
-        logger.error(f"Error calling Browser Service for action '{action}': {e}")
-        err_msg = f"Browser service unavailable: {str(e)}"
-        await broadcast_event("tool_result", {"action": action, "error": err_msg})
-        await result_callback({"error": err_msg})
+                    return {"success": True, "result": text_result}
+                err_msg = f"Browser agent error: {result_json.get('error', 'unknown')}"
+                return {"success": False, "error": err_msg}
+        except Exception as e:
+            logger.error(f"Error calling Browser Service for action '{action}': {e}")
+            return {"success": False, "error": f"Browser service unavailable: {str(e)}"}
+
+    task = asyncio.create_task(run_browser_request())
+    _inflight_browser_actions[fingerprint] = task
+
+    try:
+        outcome = await task
+        _recent_browser_action_results[fingerprint] = (time.monotonic(), outcome)
+        if outcome.get("success"):
+            await broadcast_event("tool_result", {"action": action, "result": outcome["result"]})
+            await result_callback(
+                {"result": outcome["result"]},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+        else:
+            await broadcast_event("tool_result", {"action": action, "error": outcome["error"]})
+            await result_callback(
+                {"error": outcome["error"]},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+    finally:
+        current_task = _inflight_browser_actions.get(fingerprint)
+        if current_task is task:
+            _inflight_browser_actions.pop(fingerprint, None)
 
 async def search_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
     """Callback invoked when the LLM calls the 'search_hotel' tool."""
@@ -210,7 +332,33 @@ async def select_hotel_tool(function_name, tool_call_id, args, llm, context, res
 async def reserve_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
     """Callback invoked when the LLM calls the 'reserve_hotel' tool."""
     logger.info(f"Tool 'reserve_hotel' called with args: {args}")
+    if not _user_explicitly_wants_reservation():
+        logger.info("Skipping reserve_hotel because the latest user utterance did not explicitly ask to book.")
+        await result_callback(
+            {"result": "The user has not explicitly asked to reserve the hotel yet."},
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+        return
     await invoke_browser_action("reserve_hotel", args, result_callback)
+
+
+async def fill_guest_info_tool(function_name, tool_call_id, args, llm, context, result_callback):
+    """Callback invoked when the LLM calls the 'fill_guest_info' tool."""
+    logger.info(f"Tool 'fill_guest_info' called with args: {args}")
+    await invoke_browser_action("fill_guest_info", args, result_callback)
+
+
+async def continue_to_payment_tool(function_name, tool_call_id, args, llm, context, result_callback):
+    """Callback invoked when the LLM calls the 'continue_to_payment' tool."""
+    logger.info(f"Tool 'continue_to_payment' called with args: {args}")
+    if not _user_explicitly_wants_to_continue():
+        logger.info("Skipping continue_to_payment because the latest user utterance did not explicitly ask to continue.")
+        await result_callback(
+            {"result": "The user has not explicitly asked to continue to the next step yet."},
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+        return
+    await invoke_browser_action("continue_to_payment", args, result_callback)
 
 
 
@@ -227,7 +375,6 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
         secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", ""),
         region=nova_region,
         session_token=os.getenv("AWS_SESSION_TOKEN") or None,
-        system_instruction=SYSTEM_PROMPT,  # pass directly → no need to wait for LLMContextFrame
         params=NovaSonicParams(),
     )
 
@@ -235,6 +382,8 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
     llm.register_function("search_hotel", search_hotel_tool)
     llm.register_function("select_hotel", select_hotel_tool)
     llm.register_function("reserve_hotel", reserve_hotel_tool)
+    llm.register_function("fill_guest_info", fill_guest_info_tool)
+    llm.register_function("continue_to_payment", continue_to_payment_tool)
 
     # Define tool schema for Nova Sonic via ToolsSchema
     tools = ToolsSchema(standard_tools=[
@@ -242,12 +391,19 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
             name="search_hotel",
             description="Searches for available hotels on Booking.com.",
             properties={
-                "destination": {"type": "string", "description": "City or hotel name to search for"},
-                "checkin_date": {"type": "string", "description": "Check-in date in YYYY-MM-DD format"},
-                "checkout_date": {"type": "string", "description": "Check-out date in YYYY-MM-DD format"},
-                "adults": {"type": "integer", "description": "Number of adult guests"},
+                "destination": {"type": "string", "description": "City or hotel name to search for. Optional for result refinements if the current destination should stay the same."},
+                "checkin_date": {"type": "string", "description": "Check-in date in YYYY-MM-DD format. Optional for result refinements if unchanged."},
+                "checkout_date": {"type": "string", "description": "Check-out date in YYYY-MM-DD format. Optional for result refinements if unchanged."},
+                "adults": {"type": "integer", "description": "Number of adult guests. Optional for result refinements if unchanged."},
+                "children": {"type": "integer", "description": "Number of children. Use 0 if there are no children."},
+                "children_ages": {
+                    "type": "array",
+                    "description": "Ages of the children, in order, if the user provides them.",
+                    "items": {"type": "integer"},
+                },
+                "rooms": {"type": "integer", "description": "Number of rooms to search for. Use 1 if unspecified."},
             },
-            required=["destination", "checkin_date", "checkout_date", "adults"],
+            required=[],
         ),
         FunctionSchema(
             name="select_hotel",
@@ -266,13 +422,43 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
                 "hotel_index": {"type": "integer", "description": "1-based index of the hotel option if the user says first, second, third, etc."},
             },
             required=[],
+        ),
+        FunctionSchema(
+            name="fill_guest_info",
+            description="Fills the visible Booking.com guest-information form with full name, email, region, and phone number, and can also select named optional choices shown on the page.",
+            properties={
+                "full_name": {"type": "string", "description": "Guest full name"},
+                "first_name": {"type": "string", "description": "Guest first name if provided separately"},
+                "last_name": {"type": "string", "description": "Guest last name if provided separately"},
+                "email": {"type": "string", "description": "Guest email address"},
+                "phone": {"type": "string", "description": "Guest phone number"},
+                "region": {"type": "string", "description": "Country or region shown in the booking form"},
+                "address_line1": {"type": "string", "description": "Address line 1 if the form asks for it"},
+                "address_line2": {"type": "string", "description": "Address line 2 if the form asks for it"},
+                "city": {"type": "string", "description": "City if the form asks for it"},
+                "optional_choices": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional checkbox, radio, or select choices the user wants selected on the booking form",
+                },
+                "arrival_time": {"type": "string", "description": "Arrival or check-in time if the page asks for it"},
+                "special_requests": {"type": "string", "description": "Special requests or notes for the stay"},
+            },
+            required=[],
+        ),
+        FunctionSchema(
+            name="continue_to_payment",
+            description="Clicks the next booking button after the guest confirms the visible form is complete, then reports whether the payment or final-details step opened.",
+            properties={},
+            required=[],
         )
     ])
 
     # --- Context & Aggregators ---
-    # NOTE: The system prompt must be in LLMContext as a "system" role message.
-    # If messages=[], the AWSNovaSonicLLMAdapter hits a bug (line 124 of adapter):
-    #   return self.ConvertedMessages()  ← missing required 'messages' positional arg
+    # Nova Sonic's Pipecat adapter crashes when messages=[] because its
+    # ConvertedMessages helper incorrectly requires a positional `messages`
+    # arg in that path. Keep the system prompt in context so the adapter has
+    # a valid first message and can extract the instruction normally.
     context = LLMContext(
         messages=[{"role": "system", "content": [{"text": SYSTEM_PROMPT}]}],
         tools=tools,
@@ -289,8 +475,8 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
                     confidence=0.65,
-                    start_secs=0.15,
-                    stop_secs=0.35,
+                    start_secs=0.12,
+                    stop_secs=0.25,
                     min_volume=0.45,
                 )
             ),

@@ -7,6 +7,7 @@ const BROWSER_VIEWPORT_HEIGHT = 800;
 interface ChatMessage {
     role: 'user' | 'bot';
     text: string;
+    kind?: 'speech' | 'status';
 }
 
 export default function App() {
@@ -27,11 +28,30 @@ export default function App() {
     const disconnectedRef = useRef(true);
     const browserWsReconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const browserWsRetryCount = useRef(0);
+    const pendingToolStatusRef = useRef<string | null>(null);
+    const startNewBotTurnRef = useRef(false);
 
     // Canvas + WebSocket refs for CDP screencast
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const browserWsRef = useRef<WebSocket | null>(null);
     const imgDecoderRef = useRef(new Image());
+
+    const getToolStatusMessage = useCallback((action: string) => {
+        switch (action) {
+            case 'search_hotel':
+                return 'Understood. Processing your search now.';
+            case 'select_hotel':
+                return 'Understood. Opening that hotel now.';
+            case 'reserve_hotel':
+                return 'Understood. Starting the booking flow now.';
+            case 'fill_guest_info':
+                return 'Understood. Filling the guest form now.';
+            case 'continue_to_payment':
+                return 'Understood. Moving to the next booking step now.';
+            default:
+                return 'Understood. Processing now.';
+        }
+    }, []);
 
     useEffect(() => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -172,20 +192,73 @@ export default function App() {
                 const data = JSON.parse(evt.data);
                 switch (data.type) {
                     case 'user_transcript':
-                        setChatHistory(h => [...h, { role: 'user', text: data.text }]);
+                        setChatHistory(h => {
+                            const nextHistory = [...h];
+                            const trailingStatus = nextHistory[nextHistory.length - 1];
+                            if (trailingStatus?.role === 'bot' && trailingStatus.kind === 'status') {
+                                nextHistory.splice(nextHistory.length - 1, 0, { role: 'user', text: data.text });
+                            } else {
+                                nextHistory.push({ role: 'user', text: data.text });
+                            }
+                            if (pendingToolStatusRef.current) {
+                                nextHistory.push({ role: 'bot', text: pendingToolStatusRef.current, kind: 'status' });
+                                pendingToolStatusRef.current = null;
+                            }
+                            return nextHistory;
+                        });
+                        break;
+                    case 'bot_response_start':
+                        startNewBotTurnRef.current = true;
                         break;
                     case 'bot_response':
                         setChatHistory(h => {
-                            const last = h[h.length - 1];
-                            if (last?.role === 'bot') {
-                                return [...h.slice(0, -1), { role: 'bot', text: last.text + data.text }];
+                            const nextHistory = [...h];
+                            const incoming = String(data.text || '');
+                            const normalizedIncoming = incoming.trim().replace(/\s+/g, ' ');
+                            const last = nextHistory[nextHistory.length - 1];
+
+                            if (
+                                pendingToolStatusRef.current &&
+                                (last?.role === 'user' || !last || (last.role === 'bot' && last.kind === 'status'))
+                            ) {
+                                nextHistory.push({ role: 'bot', text: pendingToolStatusRef.current, kind: 'status' });
+                                pendingToolStatusRef.current = null;
                             }
-                            return [...h, { role: 'bot', text: data.text }];
+
+                            const mergeTarget = nextHistory[nextHistory.length - 1];
+                            const normalizedLast = String(mergeTarget?.text || '').trim().replace(/\s+/g, ' ');
+                            if (
+                                !startNewBotTurnRef.current &&
+                                mergeTarget?.role === 'bot' &&
+                                mergeTarget.kind !== 'status' &&
+                                normalizedIncoming.length > 18 &&
+                                normalizedLast.includes(normalizedIncoming)
+                            ) {
+                                return nextHistory;
+                            }
+
+                            if (!startNewBotTurnRef.current && mergeTarget?.role === 'bot' && mergeTarget.kind !== 'status') {
+                                return [
+                                    ...nextHistory.slice(0, -1),
+                                    { role: 'bot', text: mergeTarget.text + incoming, kind: 'speech' },
+                                ];
+                            }
+                            startNewBotTurnRef.current = false;
+                            return [...nextHistory, { role: 'bot', text: incoming, kind: 'speech' }];
                         });
                         break;
                     case 'tool_called':
                         setIsBrowserActive(true);
                         connectBrowserWs();
+                        setChatHistory(h => {
+                            const statusMessage = getToolStatusMessage(data.action);
+                            const last = h[h.length - 1];
+                            if (last?.role === 'user') {
+                                return [...h, { role: 'bot', text: statusMessage, kind: 'status' }];
+                            }
+                            pendingToolStatusRef.current = statusMessage;
+                            return h;
+                        });
                         break;
                     case 'tool_result':
                         break;
@@ -200,7 +273,7 @@ export default function App() {
                 sseReconnectTimer.current = setTimeout(connectSSE, 2000);
             }
         };
-    }, [connectBrowserWs]);
+    }, [connectBrowserWs, getToolStatusMessage]);
 
     useEffect(() => {
         return () => {
@@ -258,6 +331,8 @@ export default function App() {
             clearTimeout(sseReconnectTimer.current);
             sseReconnectTimer.current = null;
         }
+        pendingToolStatusRef.current = null;
+        startNewBotTurnRef.current = false;
 
         setStatus('idle');
         setIsMuted(false);
@@ -270,6 +345,8 @@ export default function App() {
             disconnectedRef.current = false;
             setStatus('connecting');
             setChatHistory([]);
+            pendingToolStatusRef.current = null;
+            startNewBotTurnRef.current = false;
             setIsBrowserActive(true);
 
             setIsMuted(false);
@@ -583,11 +660,18 @@ export default function App() {
                                         maxWidth: '80%', padding: '8px 14px', borderRadius: 14, fontSize: 12.5, lineHeight: 1.55,
                                         background: msg.role === 'user'
                                             ? 'linear-gradient(135deg, #6366f1, #4f46e5)'
-                                            : 'rgba(255, 255, 255, 0.04)',
-                                        color: msg.role === 'user' ? '#fff' : '#94a3b8',
-                                        border: msg.role === 'bot' ? '1px solid rgba(255, 255, 255, 0.06)' : 'none',
+                                            : msg.kind === 'status'
+                                                ? 'rgba(59, 130, 246, 0.08)'
+                                                : 'rgba(255, 255, 255, 0.04)',
+                                        color: msg.role === 'user' ? '#fff' : msg.kind === 'status' ? '#93c5fd' : '#94a3b8',
+                                        border: msg.role === 'bot'
+                                            ? msg.kind === 'status'
+                                                ? '1px solid rgba(59, 130, 246, 0.18)'
+                                                : '1px solid rgba(255, 255, 255, 0.06)'
+                                            : 'none',
                                         borderBottomRightRadius: msg.role === 'user' ? 4 : 14,
                                         borderBottomLeftRadius: msg.role === 'bot' ? 4 : 14,
+                                        fontStyle: msg.kind === 'status' ? 'italic' : 'normal',
                                     }}>
                                         {msg.text}
                                     </div>

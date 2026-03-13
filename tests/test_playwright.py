@@ -28,6 +28,31 @@ async def test_search_hotel_success():
 
 
 @pytest.mark.asyncio
+async def test_search_hotel_refinement_with_children_and_rooms():
+    initial_params = {
+        "destination": "Paris",
+        "checkin_date": "2026-04-10",
+        "checkout_date": "2026-04-12",
+        "adults": 2,
+    }
+    refinement_params = {
+        "children": 1,
+        "children_ages": [7],
+        "rooms": 2,
+    }
+
+    try:
+        first_result = await booking_agent.execute_action("search_hotel", initial_params, session_id="test_refine_initial")
+        refined_result = await booking_agent.execute_action("search_hotel", refinement_params, session_id="test_refine_followup")
+    finally:
+        await booking_agent._safe_close()
+
+    assert first_result.get("success") is True
+    assert refined_result.get("success") is True
+    assert "Found" in refined_result.get("result", "")
+
+
+@pytest.mark.asyncio
 async def test_search_to_reservation_pipeline():
     search_params = {
         "destination": "Paris",
@@ -56,13 +81,31 @@ async def test_search_to_reservation_pipeline():
             {},
             session_id="test_reservation_pipeline_reserve",
         )
+
+        fill_result = await booking_agent.execute_action(
+            "fill_guest_info",
+            {
+                "full_name": "Wilson Chong",
+                "email": "wilson@gmail.com",
+                "phone": "0123456789",
+            },
+            session_id="test_reservation_pipeline_fill",
+        )
+
+        continue_result = await booking_agent.execute_action(
+            "continue_to_payment",
+            {},
+            session_id="test_reservation_pipeline_continue",
+        )
     finally:
         await booking_agent._safe_close()
 
     assert "i opened" in select_result.get("result", "").lower()
     assert reserve_result.get("success") is True
     assert "booking flow" in reserve_result.get("result", "").lower()
-    assert "personal information" in reserve_result.get("result", "").lower()
+    assert fill_result.get("success") is True
+    assert "filled" in fill_result.get("result", "").lower()
+    assert continue_result.get("success") is True
 
 
 @pytest.mark.asyncio
