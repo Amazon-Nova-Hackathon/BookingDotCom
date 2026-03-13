@@ -9,6 +9,7 @@ from aiohttp import web
 from dotenv import load_dotenv
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
@@ -33,6 +34,7 @@ from pipecat.frames.frames import (
     TextFrame,
     TranscriptionFrame,
     TTSTextFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 
@@ -76,53 +78,139 @@ async def broadcast_event(event_type: str, data: dict):
         await q.put(payload)
 
 
-class TranscriptionLogger(FrameProcessor):
-    """Logs speech transcriptions to terminal + broadcasts SSE events."""
+class ConversationEventLogger(FrameProcessor):
+    """Broadcasts transcript events from the correct side of the LLM."""
+
+    def __init__(self, *, capture_user: bool = False, capture_bot: bool = False):
+        super().__init__()
+        self._capture_user = capture_user
+        self._capture_bot = capture_bot
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+        if (
+            self._capture_user
+            and direction == FrameDirection.UPSTREAM
+            and isinstance(frame, TranscriptionFrame)
+            and frame.text.strip()
+        ):
             logger.info(f"🎙️  USER  → '{frame.text}'")
             await broadcast_event("user_transcript", {"text": frame.text})
-        elif isinstance(frame, TTSTextFrame) and frame.text.strip():
+        elif (
+            self._capture_bot
+            and direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, TTSTextFrame)
+            and frame.text.strip()
+        ):
             logger.info(f"🤖  BOT   → '{frame.text}'")
             await broadcast_event("bot_response", {"text": frame.text})
 
         await self.push_frame(frame, direction)
 
-async def search_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
-    """Callback invoked when the LLM calls the 'search_hotel' tool."""
-    logger.info(f"Tool 'search_hotel' called with args: {args}")
-    session_id = str(uuid.uuid4())
 
-    # Broadcast extraction event so the UI can show the filled-in form
-    await broadcast_event("tool_called", {"args": args})
+class AssistantTurnTrigger(FrameProcessor):
+    """Triggers Nova Sonic to answer when the user finishes speaking."""
+
+    def __init__(self, llm):
+        super().__init__()
+        self._llm = llm
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, UserStoppedSpeakingFrame):
+            await self._llm.trigger_assistant_response()
+
+        await self.push_frame(frame, direction)
+
+
+class ResilientAWSNovaSonicLLMService(AWSNovaSonicLLMService):
+    """Suppresses expected closed-stream races during disconnect."""
+
+    @staticmethod
+    def _is_closed_stream_error(exc: BaseException) -> bool:
+        messages = [str(exc).lower()]
+        cause = exc.__cause__
+        while cause:
+            messages.append(str(cause).lower())
+            cause = cause.__cause__
+
+        return any(
+            token in message
+            for message in messages
+            for token in (
+                "closed stream",
+                "failed to write to stream",
+                "closed or closing provider",
+                "attempted to write to a closed",
+            )
+        )
+
+    async def _send_client_event(self, event_json: str):
+        if self._disconnecting or not self._stream:
+            return
+
+        try:
+            await super()._send_client_event(event_json)
+        except Exception as exc:
+            if not self._is_closed_stream_error(exc):
+                raise
+
+            # The WebRTC side can disconnect while a few buffered mic frames are
+            # still draining through the pipeline. Treat that as a normal teardown.
+            logger.warning("Nova Sonic stream is already closing; dropping late audio/event frame.")
+            self._disconnecting = True
+            self._stream = None
+
+
+async def invoke_browser_action(action: str, args: dict, result_callback):
+    session_id = str(uuid.uuid4())
+    await broadcast_event("tool_called", {"action": action, "args": args})
 
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
-                "action": "search_hotel",
+                "action": action,
                 "params": args,
                 "session_id": session_id,
                 "request_id": session_id,
             }
-            logger.info("Forwarding to Browser Agent Service...")
+            logger.info(f"Forwarding action '{action}' to Browser Agent Service...")
             async with session.post(
                 f"{BROWSER_SERVICE_URL}/api/execute", json=payload, timeout=aiohttp.ClientTimeout(total=120)
             ) as response:
                 result_json = await response.json()
                 if result_json.get("success"):
-                    text_result = result_json.get("result", "Search completed.")
+                    text_result = result_json.get("result", "Action completed.")
+                    await broadcast_event("tool_result", {"action": action, "result": text_result})
+                    await result_callback({"result": text_result})
                 else:
-                    text_result = f"Browser agent error: {result_json.get('error', 'unknown')}"
-                await broadcast_event("tool_result", {"result": text_result})
-                await result_callback({"result": text_result})
+                    err_msg = f"Browser agent error: {result_json.get('error', 'unknown')}"
+                    await broadcast_event("tool_result", {"action": action, "error": err_msg})
+                    await result_callback({"error": err_msg})
     except Exception as e:
-        logger.error(f"Error calling Browser Service: {e}")
+        logger.error(f"Error calling Browser Service for action '{action}': {e}")
         err_msg = f"Browser service unavailable: {str(e)}"
-        await broadcast_event("tool_result", {"error": err_msg})
+        await broadcast_event("tool_result", {"action": action, "error": err_msg})
         await result_callback({"error": err_msg})
+
+async def search_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
+    """Callback invoked when the LLM calls the 'search_hotel' tool."""
+    logger.info(f"Tool 'search_hotel' called with args: {args}")
+    await invoke_browser_action("search_hotel", args, result_callback)
+
+
+async def select_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
+    """Callback invoked when the LLM calls the 'select_hotel' tool."""
+    logger.info(f"Tool 'select_hotel' called with args: {args}")
+    await invoke_browser_action("select_hotel", args, result_callback)
+
+
+async def reserve_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
+    """Callback invoked when the LLM calls the 'reserve_hotel' tool."""
+    logger.info(f"Tool 'reserve_hotel' called with args: {args}")
+    await invoke_browser_action("reserve_hotel", args, result_callback)
 
 
 
@@ -133,7 +221,7 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
     # --- Nova Sonic LLM ---
     nova_region = os.getenv("NOVA_SONIC_REGION", "us-east-1")
     logger.info(f"Nova Sonic region: {nova_region}, model: {os.getenv('NOVA_SONIC_MODEL_ID', 'amazon.nova-2-sonic-v1:0')}")
-    llm = AWSNovaSonicLLMService(
+    llm = ResilientAWSNovaSonicLLMService(
         model=os.getenv("NOVA_SONIC_MODEL_ID", "amazon.nova-2-sonic-v1:0"),
         access_key_id=os.getenv("AWS_ACCESS_KEY_ID", ""),
         secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", ""),
@@ -145,6 +233,8 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
 
     # Register handler (just the name + callback, no extra kwargs)
     llm.register_function("search_hotel", search_hotel_tool)
+    llm.register_function("select_hotel", select_hotel_tool)
+    llm.register_function("reserve_hotel", reserve_hotel_tool)
 
     # Define tool schema for Nova Sonic via ToolsSchema
     tools = ToolsSchema(standard_tools=[
@@ -158,6 +248,24 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
                 "adults": {"type": "integer", "description": "Number of adult guests"},
             },
             required=["destination", "checkin_date", "checkout_date", "adults"],
+        ),
+        FunctionSchema(
+            name="select_hotel",
+            description="Opens a hotel detail page on Booking.com and returns a short summary of the selected hotel.",
+            properties={
+                "hotel_name": {"type": "string", "description": "Hotel name chosen by the user, if they mentioned one"},
+                "hotel_index": {"type": "integer", "description": "1-based index of the hotel option if the user says first, second, third, etc."},
+            },
+            required=[],
+        ),
+        FunctionSchema(
+            name="reserve_hotel",
+            description="Clicks the booking or reserve button for the current hotel and moves into the guest-information step.",
+            properties={
+                "hotel_name": {"type": "string", "description": "Hotel name chosen by the user, if they mentioned one"},
+                "hotel_index": {"type": "integer", "description": "1-based index of the hotel option if the user says first, second, third, etc."},
+            },
+            required=[],
         )
     ])
 
@@ -178,7 +286,14 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
             audio_in_enabled=True,
             audio_out_enabled=True,
             vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    confidence=0.65,
+                    start_secs=0.15,
+                    stop_secs=0.35,
+                    min_volume=0.45,
+                )
+            ),
         ),
     )
 
@@ -192,8 +307,10 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
     pipeline = Pipeline(
         [
             transport.input(),
+            AssistantTurnTrigger(llm),
+            ConversationEventLogger(capture_user=True),
             llm,                         # Nova Sonic S2S handles audio directly
-            TranscriptionLogger(),       # logs USER + BOT text to terminal
+            ConversationEventLogger(capture_bot=True),
             transport.output(),
             context_aggregator.assistant(),  # keeps conversation history
         ]

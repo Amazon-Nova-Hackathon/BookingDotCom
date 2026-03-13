@@ -7,6 +7,7 @@ Communicates with Browser Agent Service via HTTP API.
 """
 import sys
 import os
+from loguru import logger
 
 # Filter ONNX Runtime GPU warning (harmless on CPU-only systems)
 class FilteredStderr:
@@ -26,9 +27,11 @@ class FilteredStderr:
 sys.stderr = FilteredStderr(sys.stderr)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
+logger.remove()
+logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
+
 from src.voice_bot import create_app
 from aiohttp import web
-from loguru import logger
 from dotenv import load_dotenv
 
 load_dotenv()

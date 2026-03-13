@@ -1,13 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected';
-
-interface BookingParams {
-    destination?: string;
-    checkin_date?: string;
-    checkout_date?: string;
-    adults?: number;
-}
+const BROWSER_VIEWPORT_WIDTH = 1280;
+const BROWSER_VIEWPORT_HEIGHT = 800;
 
 interface ChatMessage {
     role: 'user' | 'bot';
@@ -17,9 +12,8 @@ interface ChatMessage {
 export default function App() {
     const [status, setStatus] = useState<ConnectionStatus>('idle');
     const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
-    const [bookingParams, setBookingParams] = useState<BookingParams>({});
     const [isBrowserActive, setIsBrowserActive] = useState(false);
-    const [browserStatus, setBrowserStatus] = useState('Waiting for search request...');
+
     const [isMuted, setIsMuted] = useState(false);
     const [hasBrowserFrame, setHasBrowserFrame] = useState(false);
 
@@ -80,7 +74,6 @@ export default function App() {
         ws.onclose = () => {
             console.log('[BrowserWS] Disconnected');
             browserWsRef.current = null;
-            // Reconnect with backoff if browser is still active
             if (isBrowserActive && !disconnectedRef.current) {
                 const delay = Math.min(1000 * Math.pow(2, browserWsRetryCount.current), 5000);
                 browserWsRetryCount.current++;
@@ -115,27 +108,20 @@ export default function App() {
         }
     }, []);
 
-    // Scale canvas click position → browser viewport (1280×800)
-    const scaleCoords = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const scaleCoords = useCallback((clientX: number, clientY: number) => {
         const canvas = canvasRef.current;
         if (!canvas) return { x: 0, y: 0 };
         const rect = canvas.getBoundingClientRect();
         return {
-            x: Math.round((e.clientX - rect.left) / rect.width * 1280),
-            y: Math.round((e.clientY - rect.top) / rect.height * 800),
+            x: Math.round((clientX - rect.left) / rect.width * BROWSER_VIEWPORT_WIDTH),
+            y: Math.round((clientY - rect.top) / rect.height * BROWSER_VIEWPORT_HEIGHT),
         };
     }, []);
 
     const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-        const { x, y } = scaleCoords(e);
+        const { x, y } = scaleCoords(e.clientX, e.clientY);
         console.log(`[Click] (${x}, ${y})`);
         sendBrowserInput({ type: 'click', x, y });
-    }, [scaleCoords, sendBrowserInput]);
-
-    const handleCanvasScroll = useCallback((e: React.WheelEvent<HTMLCanvasElement>) => {
-        e.preventDefault();
-        const { x, y } = scaleCoords(e);
-        sendBrowserInput({ type: 'scroll', x, y, deltaX: e.deltaX, deltaY: Math.round(e.deltaY) });
     }, [scaleCoords, sendBrowserInput]);
 
     const handleCanvasKeyDown = useCallback((e: React.KeyboardEvent<HTMLCanvasElement>) => {
@@ -148,6 +134,28 @@ export default function App() {
             sendBrowserInput({ type: 'type', text: e.key });
         }
     }, [sendBrowserInput]);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        const handleWheel = (event: WheelEvent) => {
+            event.preventDefault();
+            const { x, y } = scaleCoords(event.clientX, event.clientY);
+            sendBrowserInput({
+                type: 'scroll',
+                x,
+                y,
+                deltaX: Math.round(event.deltaX),
+                deltaY: Math.round(event.deltaY),
+            });
+        };
+
+        canvas.addEventListener('wheel', handleWheel, { passive: false });
+        return () => {
+            canvas.removeEventListener('wheel', handleWheel);
+        };
+    }, [hasBrowserFrame, isBrowserActive, scaleCoords, sendBrowserInput]);
 
     // ── SSE ───────────────────────────────────────────────────────────────
     const connectSSE = useCallback(() => {
@@ -176,14 +184,10 @@ export default function App() {
                         });
                         break;
                     case 'tool_called':
-                        setBookingParams(data.args ?? {});
                         setIsBrowserActive(true);
-                        setBrowserStatus('🤖 Searching on Booking.com...');
-                        // Connect browser WS when tool is called
                         connectBrowserWs();
                         break;
                     case 'tool_result':
-                        setBrowserStatus(data.error ? '❌ Search failed' : '✅ Search complete');
                         break;
                 }
             } catch { }
@@ -255,10 +259,9 @@ export default function App() {
             sseReconnectTimer.current = null;
         }
 
-        // Don't disconnect browser WS — keep browser view alive after voice ends
         setStatus('idle');
         setIsMuted(false);
-        setBrowserStatus('Waiting for search request...');
+        setIsBrowserActive(false);
     }, []);
 
     // ── Start ─────────────────────────────────────────────────────────────
@@ -267,16 +270,22 @@ export default function App() {
             disconnectedRef.current = false;
             setStatus('connecting');
             setChatHistory([]);
-            setBookingParams({});
-            setIsBrowserActive(false);
-            setBrowserStatus('Waiting for search request...');
+            setIsBrowserActive(true);
+
             setIsMuted(false);
             setHasBrowserFrame(false);
 
+            connectBrowserWs();
             connectSSE();
-            // Browser WS will connect when tool_called SSE event is received
 
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                    channelCount: 1,
+                },
+            });
             mediaStreamRef.current = stream;
             const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
             pcRef.current = pc;
@@ -341,256 +350,392 @@ export default function App() {
         setIsMuted(!audioTrack.enabled);
     };
 
-    const formatDate = (d?: string) => {
-        if (!d) return null;
-        const [y, m, day] = d.split('-');
-        return `${day}/${m}/${y}`;
-    };
-
-    const filledCount = [bookingParams.destination, bookingParams.checkin_date, bookingParams.checkout_date, bookingParams.adults].filter(Boolean).length;
+    const lastUserMsg = [...chatHistory].reverse().find(m => m.role === 'user')?.text;
+    const lastBotMsg = [...chatHistory].reverse().find(m => m.role === 'bot')?.text;
 
     return (
         <div style={{
-            display: 'flex', height: '100vh',
-            background: '#0d0d1f', color: '#e2e8f0',
+            display: 'flex', flexDirection: 'column', height: '100vh',
+            background: '#080816', color: '#e2e8f0',
             fontFamily: "'Inter', sans-serif", overflow: 'hidden',
         }}>
 
-            {/* ── LEFT (30%) ── */}
-            <div style={{
-                width: '30%', minWidth: 280,
-                display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-                gap: 28, padding: '28px 20px',
-                background: 'linear-gradient(160deg, #0f0f1a 0%, #1a1a2e 100%)',
-                borderRight: '1px solid rgba(99,102,241,0.18)',
+            {/* ── TOP NAV BAR ── */}
+            <nav style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '0 24px', height: 52, minHeight: 52,
+                background: 'rgba(12, 12, 28, 0.95)',
+                borderBottom: '1px solid rgba(99, 102, 241, 0.12)',
+                backdropFilter: 'blur(12px)',
             }}>
-                {/* Branding */}
-                <div style={{ textAlign: 'center' }}>
-                    <div style={{ fontSize: 38, marginBottom: 6 }}>🏨</div>
-                    <h1 style={{
-                        fontSize: 20, fontWeight: 800, margin: 0,
-                        background: 'linear-gradient(135deg, #818cf8, #38bdf8)',
-                        WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-                    }}>Booking Voice AI</h1>
-                    <p style={{ fontSize: 11, color: '#475569', margin: '4px 0 0' }}>Powered by Amazon Nova Sonic</p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div style={{
+                        width: 48, height: 48, borderRadius: 8,
+                        background: 'transparent',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: 16,
+                    }}><img src="/logo.png" alt="Logo" style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 8 }} /></div>
+                    <div>
+                        <span style={{
+                            fontSize: 15, fontWeight: 700,
+                            background: 'linear-gradient(135deg, #818cf8, #38bdf8)',
+                            WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
+                        }}>Booking Voice AI</span>
+                        <span style={{ fontSize: 10, color: '#475569', marginLeft: 8, textTransform: 'uppercase', letterSpacing: 1.2 }}>Amazon Nova Hackathon</span>
+                    </div>
                 </div>
 
-                {/* Mic + Mute buttons */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                    <div style={{ position: 'relative', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                        {status === 'connected' && (
-                            <div style={{
-                                position: 'absolute', width: 136, height: 136, borderRadius: '50%',
-                                background: 'rgba(16,185,129,0.12)', animation: 'ping 2s ease-in-out infinite',
-                                pointerEvents: 'none',
-                            }} />
-                        )}
-                        <button
-                            id={status === 'idle' ? 'btn-start' : 'btn-stop'}
-                            onClick={status === 'idle' ? startInteraction : disconnect}
-                            style={{
-                                position: 'relative', zIndex: 1,
-                                width: 100, height: 100, borderRadius: '50%', border: 'none',
-                                cursor: status === 'connecting' ? 'wait' : 'pointer',
-                                display: 'flex', flexDirection: 'column', alignItems: 'center',
-                                justifyContent: 'center', gap: 4, fontSize: 11, fontWeight: 700,
-                                color: '#fff', transition: 'all 0.3s',
-                                background: status === 'connected'
-                                    ? 'linear-gradient(135deg,#ef4444,#dc2626)'
-                                    : status === 'connecting'
-                                        ? 'linear-gradient(135deg,#f59e0b,#d97706)'
-                                        : 'linear-gradient(135deg,#6366f1,#4f46e5)',
-                                boxShadow: status === 'connected'
-                                    ? '0 0 40px rgba(239,68,68,0.5)'
-                                    : '0 0 40px rgba(99,102,241,0.5)',
-                            }}
-                        >
-                            <span style={{ fontSize: 24 }}>{status === 'connected' ? '🔴' : status === 'connecting' ? '⏳' : '🎙️'}</span>
-                            <span>{status === 'connected' ? 'Stop' : status === 'connecting' ? 'Connecting...' : 'Start'}</span>
-                        </button>
-                    </div>
-
                     {status === 'connected' && (
-                        <button
-                            onClick={toggleMute}
-                            title={isMuted ? 'Unmute' : 'Mute'}
-                            style={{
-                                width: 48, height: 48, borderRadius: '50%', border: 'none',
-                                cursor: 'pointer',
-                                background: isMuted
-                                    ? 'linear-gradient(135deg,#ef4444,#dc2626)'
-                                    : 'linear-gradient(135deg,#10b981,#059669)',
-                                color: '#fff', fontSize: 20,
-                                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                boxShadow: isMuted
-                                    ? '0 0 16px rgba(239,68,68,0.4)'
-                                    : '0 0 16px rgba(16,185,129,0.4)',
-                                transition: 'all 0.3s',
-                            }}
-                        >
-                            {isMuted ? '🔇' : '🔊'}
-                        </button>
-                    )}
-                </div>
-
-                {/* Connection state */}
-                <div style={{
-                    display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
-                    color: status === 'connected' ? (isMuted ? '#f59e0b' : '#10b981') : status === 'connecting' ? '#f59e0b' : '#475569',
-                }}>
-                    <div style={{
-                        width: 8, height: 8, borderRadius: '50%',
-                        background: status === 'connected' ? (isMuted ? '#f59e0b' : '#10b981') : status === 'connecting' ? '#f59e0b' : '#1e293b',
-                        boxShadow: status === 'connected' ? `0 0 8px ${isMuted ? '#f59e0b' : '#10b981'}` : undefined,
-                    }} />
-                    {status === 'connected'
-                        ? (isMuted ? 'Muted — Press 🔊 to unmute' : 'Connected — Start speaking')
-                        : status === 'connecting' ? 'Connecting...' : 'Ready'}
-                </div>
-
-                {/* Extracted params */}
-                <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    {[
-                        { label: '📍 Destination', val: bookingParams.destination },
-                        { label: '📅 Check-in', val: formatDate(bookingParams.checkin_date) },
-                        { label: '📅 Check-out', val: formatDate(bookingParams.checkout_date) },
-                        { label: '👥 Adults', val: bookingParams.adults != null ? `${bookingParams.adults}` : undefined },
-                    ].map(({ label, val }) => (
-                        <div key={label} style={{
-                            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                            background: val ? 'rgba(99,102,241,0.1)' : 'rgba(255,255,255,0.03)',
-                            border: `1px solid ${val ? 'rgba(99,102,241,0.3)' : 'rgba(255,255,255,0.06)'}`,
-                            borderRadius: 8, padding: '8px 12px', fontSize: 12, transition: 'all 0.3s',
-                        }}>
-                            <span style={{ color: '#64748b' }}>{label}</span>
-                            <span style={{ color: val ? '#a5b4fc' : '#1e293b', fontWeight: val ? 600 : 400 }}>
-                                {val || '—'}
-                            </span>
-                        </div>
-                    ))}
-
-                    {filledCount > 0 && (
-                        <div style={{ marginTop: 4 }}>
-                            <div style={{ height: 3, background: 'rgba(255,255,255,0.05)', borderRadius: 3 }}>
-                                <div style={{
-                                    height: '100%', borderRadius: 3,
-                                    background: 'linear-gradient(90deg,#6366f1,#38bdf8)',
-                                    width: `${filledCount * 25}%`, transition: 'width 0.5s ease',
-                                }} />
-                            </div>
-                            <div style={{ fontSize: 10, color: '#475569', marginTop: 4, textAlign: 'right' }}>
-                                {filledCount}/4
-                            </div>
-                        </div>
-                    )}
-                </div>
-
-                {/* Instruction (idle only) */}
-                {status === 'idle' && (
-                    <div style={{
-                        background: 'rgba(99,102,241,0.07)', border: '1px solid rgba(99,102,241,0.18)',
-                        borderRadius: 10, padding: '12px 14px', fontSize: 11, color: '#64748b', lineHeight: 1.6,
-                    }}>
-                        <p style={{ margin: '0 0 6px', fontWeight: 600, color: '#818cf8' }}>💡 Example phrase</p>
-                        <p style={{ margin: 0, fontStyle: 'italic', color: '#6366f1' }}>
-                            "Find a hotel in Paris, check in March 1st, check out March 3rd, 2 adults"
-                        </p>
-                    </div>
-                )}
-            </div>
-
-            {/* ── RIGHT (70%) — Browser View ── */}
-            <div style={{ width: '70%', display: 'flex', flexDirection: 'column', background: '#090915' }}>
-
-                {/* Chat strip */}
-                <div style={{
-                    height: 180, borderBottom: '1px solid rgba(99,102,241,0.12)',
-                    overflowY: 'auto', padding: '12px 20px', display: 'flex', flexDirection: 'column', gap: 8,
-                    background: 'rgba(15,15,30,0.9)',
-                }}>
-                    {chatHistory.length === 0 ? (
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#1e293b', fontSize: 13 }}>
-                            💬 Conversation will appear here
-                        </div>
-                    ) : chatHistory.map((msg, i) => (
-                        <div key={i} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
-                            <div style={{
-                                maxWidth: '75%', padding: '7px 12px', borderRadius: 12, fontSize: 12, lineHeight: 1.5,
-                                background: msg.role === 'user' ? 'linear-gradient(135deg,#6366f1,#4f46e5)' : 'rgba(255,255,255,0.06)',
-                                color: msg.role === 'user' ? '#fff' : '#94a3b8',
-                                border: msg.role === 'bot' ? '1px solid rgba(255,255,255,0.07)' : 'none',
-                                borderBottomRightRadius: msg.role === 'user' ? 3 : 12,
-                                borderBottomLeftRadius: msg.role === 'bot' ? 3 : 12,
-                            }}>
-                                <span style={{ fontSize: 10, opacity: 0.5, marginRight: 6 }}>
-                                    {msg.role === 'user' ? '🎙️' : '🤖'}
-                                </span>
-                                {msg.text}
-                            </div>
-                        </div>
-                    ))}
-                    <div ref={chatEndRef} />
-                </div>
-
-                {/* Browser viewport */}
-                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-
-                    {/* Status bar */}
-                    {isBrowserActive && (
                         <div style={{
-                            padding: '10px 20px', display: 'flex', alignItems: 'center', gap: 10,
-                            background: 'rgba(0,0,0,0.3)', borderBottom: '1px solid rgba(255,255,255,0.05)',
-                            fontSize: 12, color: '#f59e0b',
+                            display: 'flex', alignItems: 'center', gap: 6,
+                            background: 'rgba(16, 185, 129, 0.12)',
+                            border: '1px solid rgba(16, 185, 129, 0.3)',
+                            borderRadius: 20, padding: '4px 12px',
                         }}>
                             <div style={{
-                                width: 8, height: 8, borderRadius: '50%',
-                                background: hasBrowserFrame ? '#10b981' : '#f59e0b',
-                                boxShadow: `0 0 8px ${hasBrowserFrame ? '#10b981' : '#f59e0b'}`,
-                                animation: 'pulse 1.2s ease-in-out infinite',
+                                width: 6, height: 6, borderRadius: '50%',
+                                background: '#10b981',
+                                boxShadow: '0 0 8px #10b981',
+                                animation: 'pulse 2s ease-in-out infinite',
                             }} />
-                            <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#475569' }}>
-                                🌐 https://www.booking.com
-                            </span>
-                            <span style={{ marginLeft: 'auto', color: hasBrowserFrame ? '#10b981' : '#f59e0b' }}>{browserStatus}</span>
-                            <span style={{ fontSize: 10, color: '#475569', marginLeft: 8 }}>
-                                🖱️ Click / scroll / type to interact
-                            </span>
+                            <span style={{ fontSize: 11, color: '#10b981', fontWeight: 600 }}>Live Session</span>
                         </div>
                     )}
+                    {isBrowserActive && hasBrowserFrame && (
+                        <div style={{
+                            display: 'flex', alignItems: 'center', gap: 6,
+                            background: 'rgba(56, 189, 248, 0.08)',
+                            border: '1px solid rgba(56, 189, 248, 0.2)',
+                            borderRadius: 20, padding: '4px 12px',
+                        }}>
+                            <span style={{ fontSize: 11, color: '#38bdf8', fontWeight: 500 }}>CDP Streaming</span>
+                        </div>
+                    )}
+                </div>
+            </nav>
 
-                    {/* Canvas (CDP screencast) or placeholder */}
-                    <div style={{ flex: 1, overflow: 'hidden', position: 'relative', background: '#060611' }}>
+            {/* ── MAIN CONTENT ── */}
+            <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minWidth: 0 }}>
+
+                {/* ── LEFT SIDEBAR (28%) ── */}
+                <div style={{
+                    width: '28%', minWidth: 300, maxWidth: 380,
+                    display: 'flex', flexDirection: 'column',
+                    background: 'linear-gradient(180deg, #0c0c1e 0%, #0f0f1f 100%)',
+                    borderRight: '1px solid rgba(99, 102, 241, 0.1)',
+                }}>
+
+                    {/* Voice Control Section */}
+                    <div style={{
+                        padding: '24px 20px',
+                        display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16,
+                        borderBottom: '1px solid rgba(99, 102, 241, 0.08)',
+                    }}>
+                        <span style={{
+                            fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
+                            letterSpacing: 1.5, color: '#475569',
+                        }}>Voice Control</span>
+
+                        {/* Connection status */}
+                        <div style={{
+                            display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+                            color: status === 'connected'
+                                ? (isMuted ? '#f59e0b' : '#10b981')
+                                : status === 'connecting' ? '#f59e0b' : '#475569',
+                        }}>
+                            <div style={{
+                                width: 7, height: 7, borderRadius: '50%',
+                                background: status === 'connected'
+                                    ? (isMuted ? '#f59e0b' : '#10b981')
+                                    : status === 'connecting' ? '#f59e0b' : '#1e293b',
+                                boxShadow: status === 'connected'
+                                    ? `0 0 10px ${isMuted ? '#f59e0b' : '#10b981'}`
+                                    : undefined,
+                            }} />
+                            <span style={{ fontWeight: 500 }}>
+                                {status === 'connected'
+                                    ? (isMuted ? 'Muted' : 'Connected — Start speaking')
+                                    : status === 'connecting' ? 'Connecting...' : 'Ready'}
+                            </span>
+                        </div>
+
+                        {/* Mic + Mute buttons */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                            <div style={{ position: 'relative', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                                {status === 'connected' && (
+                                    <div style={{
+                                        position: 'absolute', width: 100, height: 100, borderRadius: '50%',
+                                        background: 'rgba(239, 68, 68, 0.1)',
+                                        animation: 'ping 2s ease-in-out infinite',
+                                        pointerEvents: 'none',
+                                    }} />
+                                )}
+                                <button
+                                    id={status === 'idle' ? 'btn-start' : 'btn-stop'}
+                                    onClick={status === 'idle' ? startInteraction : disconnect}
+                                    style={{
+                                        position: 'relative', zIndex: 1,
+                                        width: 72, height: 72, borderRadius: '50%', border: 'none',
+                                        cursor: status === 'connecting' ? 'wait' : 'pointer',
+                                        display: 'flex', flexDirection: 'column', alignItems: 'center',
+                                        justifyContent: 'center', gap: 2, fontSize: 10, fontWeight: 700,
+                                        color: '#fff', transition: 'all 0.3s ease',
+                                        background: status === 'connected'
+                                            ? 'linear-gradient(135deg, #ef4444, #dc2626)'
+                                            : status === 'connecting'
+                                                ? 'linear-gradient(135deg, #f59e0b, #d97706)'
+                                                : 'linear-gradient(135deg, #6366f1, #4f46e5)',
+                                        boxShadow: status === 'connected'
+                                            ? '0 0 32px rgba(239, 68, 68, 0.4)'
+                                            : status === 'connecting'
+                                                ? '0 0 32px rgba(245, 158, 11, 0.3)'
+                                                : '0 0 32px rgba(99, 102, 241, 0.4)',
+                                    }}
+                                >
+                                    <span style={{ fontSize: 22 }}>
+                                        {status === 'connected' ? '⏹' : status === 'connecting' ? '⏳' : '🎙️'}
+                                    </span>
+                                    <span>{status === 'connected' ? 'Stop' : status === 'connecting' ? 'Wait...' : 'Start'}</span>
+                                </button>
+                            </div>
+
+                            {status === 'connected' && (
+                                <button
+                                    onClick={toggleMute}
+                                    title={isMuted ? 'Unmute' : 'Mute'}
+                                    style={{
+                                        width: 42, height: 42, borderRadius: '50%',
+                                        cursor: 'pointer',
+                                        background: isMuted
+                                            ? 'linear-gradient(135deg, #ef4444, #dc2626)'
+                                            : 'rgba(255, 255, 255, 0.06)',
+                                        color: '#fff', fontSize: 18,
+                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                        border: isMuted ? 'none' : '1px solid rgba(255,255,255,0.1)',
+                                        transition: 'all 0.3s',
+                                    }}
+                                >
+                                    {isMuted ? '🔇' : '🎤'}
+                                </button>
+                            )}
+                        </div>
+
+                        {/* Audio waveform visualizer (decorative) */}
+                        {status === 'connected' && !isMuted && (
+                            <div style={{
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                gap: 3, height: 24, width: '100%',
+                                background: 'rgba(99, 102, 241, 0.06)',
+                                borderRadius: 8, padding: '0 16px',
+                            }}>
+                                {Array.from({ length: 20 }).map((_, i) => (
+                                    <div
+                                        key={i}
+                                        style={{
+                                            width: 3, borderRadius: 2,
+                                            background: 'linear-gradient(to top, #6366f1, #38bdf8)',
+                                            animation: `waveform 1.2s ease-in-out ${i * 0.06}s infinite`,
+                                            height: 4,
+                                        }}
+                                    />
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Conversation Section */}
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                        <div style={{
+                            padding: '12px 20px 8px',
+                            fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
+                            letterSpacing: 1.5, color: '#475569',
+                        }}>Conversation</div>
+
+                        <div style={{
+                            flex: 1, overflowY: 'auto', padding: '4px 16px 16px',
+                            display: 'flex', flexDirection: 'column', gap: 10,
+                        }}>
+                            {chatHistory.length === 0 ? (
+                                <div style={{
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                    height: '100%', color: '#1e293b', fontSize: 12, textAlign: 'center',
+                                    padding: '0 20px', lineHeight: 1.6,
+                                }}>
+                                    <span style={{ color: '#334155' }}>
+                                        💬 Conversation will appear here once you start speaking...
+                                    </span>
+                                </div>
+                            ) : chatHistory.map((msg, i) => (
+                                <div key={i} style={{
+                                    display: 'flex',
+                                    justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                                }}>
+                                    {msg.role === 'bot' && (
+                                        <div style={{
+                                            width: 24, height: 24, borderRadius: '50%',
+                                            background: 'rgba(99, 102, 241, 0.15)',
+                                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                            fontSize: 11, marginRight: 8, flexShrink: 0, marginTop: 2,
+                                        }}>🤖</div>
+                                    )}
+                                    <div style={{
+                                        maxWidth: '80%', padding: '8px 14px', borderRadius: 14, fontSize: 12.5, lineHeight: 1.55,
+                                        background: msg.role === 'user'
+                                            ? 'linear-gradient(135deg, #6366f1, #4f46e5)'
+                                            : 'rgba(255, 255, 255, 0.04)',
+                                        color: msg.role === 'user' ? '#fff' : '#94a3b8',
+                                        border: msg.role === 'bot' ? '1px solid rgba(255, 255, 255, 0.06)' : 'none',
+                                        borderBottomRightRadius: msg.role === 'user' ? 4 : 14,
+                                        borderBottomLeftRadius: msg.role === 'bot' ? 4 : 14,
+                                    }}>
+                                        {msg.text}
+                                    </div>
+                                    {msg.role === 'user' && (
+                                        <div style={{
+                                            width: 24, height: 24, borderRadius: '50%',
+                                            background: 'rgba(99, 102, 241, 0.3)',
+                                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                            fontSize: 11, marginLeft: 8, flexShrink: 0, marginTop: 2,
+                                        }}>👤</div>
+                                    )}
+                                </div>
+                            ))}
+                            <div ref={chatEndRef} />
+                        </div>
+                    </div>
+
+                    {/* Tip box (idle only) */}
+                    {status === 'idle' && (
+                        <div style={{
+                            margin: '0 16px 16px',
+                            background: 'rgba(99, 102, 241, 0.06)',
+                            border: '1px solid rgba(99, 102, 241, 0.12)',
+                            borderRadius: 12, padding: '14px 16px',
+                        }}>
+                            <div style={{ fontSize: 10, fontWeight: 600, color: '#818cf8', marginBottom: 6, textTransform: 'uppercase', letterSpacing: 1 }}>
+                                Try saying
+                            </div>
+                            <p style={{
+                                margin: 0, fontSize: 12, color: '#6366f1',
+                                fontStyle: 'italic', lineHeight: 1.5,
+                            }}>
+                                "Find me a luxury boutique hotel in Paris with a balcony view of the Eiffel Tower for next weekend."
+                            </p>
+                        </div>
+                    )}
+                </div>
+
+                {/* ── RIGHT PANEL (72%) — Browser View ── */}
+                <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: '#060611' }}>
+
+                    {/* Live Transcript Strip */}
+                    <div style={{
+                        display: 'none',
+                        height: 40, minHeight: 40,
+                        alignItems: 'center', gap: 16,
+                        padding: '0 20px',
+                        background: 'rgba(15, 15, 30, 0.95)',
+                        borderBottom: '1px solid rgba(99, 102, 241, 0.08)',
+                        overflow: 'hidden',
+                    }}>
+                        <div style={{
+                            fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
+                            letterSpacing: 1.2, color: '#475569', flexShrink: 0,
+                            display: 'flex', alignItems: 'center', gap: 6,
+                        }}>
+                            <span style={{ fontSize: 12 }}>💬</span>
+                            Live Transcript
+                        </div>
+                        <div style={{
+                            flex: 1, display: 'flex', alignItems: 'center', gap: 12,
+                            overflow: 'hidden', fontSize: 12, minWidth: 0,
+                        }}>
+                            {lastUserMsg && (
+                                <span style={{
+                                    color: '#818cf8', whiteSpace: 'nowrap',
+                                    minWidth: 0,
+                                    overflow: 'hidden', textOverflow: 'ellipsis',
+                                }}>
+                                    "{lastUserMsg}"
+                                </span>
+                            )}
+                            {lastBotMsg && (
+                                <>
+                                    <span style={{ color: '#1e293b' }}>›</span>
+                                    <span style={{
+                                        color: '#64748b', whiteSpace: 'nowrap',
+                                        minWidth: 0,
+                                        overflow: 'hidden', textOverflow: 'ellipsis',
+                                    }}>
+                                        "{lastBotMsg}"
+                                    </span>
+                                </>
+                            )}
+                            {!lastUserMsg && !lastBotMsg && (
+                                <span style={{ color: '#1e293b', fontStyle: 'italic' }}>
+                                    Waiting for voice input...
+                                </span>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Browser viewport */}
+                    <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', position: 'relative' }}>
+
                         {isBrowserActive ? (
-                            <canvas
-                                ref={canvasRef}
-                                width={1280}
-                                height={800}
-                                tabIndex={0}
-                                onClick={handleCanvasClick}
-                                onWheel={handleCanvasScroll}
-                                onKeyDown={handleCanvasKeyDown}
-                                style={{
-                                    width: '100%', height: '100%', objectFit: 'contain',
-                                    display: 'block', cursor: 'pointer', outline: 'none',
-                                    background: '#0a0a1a',
-                                }}
-                            />
+                            <div style={{
+                                flex: 1,
+                                minWidth: 0,
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                overflow: 'hidden',
+                                background: '#0a0a1a',
+                            }}>
+                                <canvas
+                                    ref={canvasRef}
+                                    width={BROWSER_VIEWPORT_WIDTH}
+                                    height={BROWSER_VIEWPORT_HEIGHT}
+                                    tabIndex={0}
+                                    onClick={handleCanvasClick}
+                                    onKeyDown={handleCanvasKeyDown}
+                                    style={{
+                                        width: '100%',
+                                        height: 'auto',
+                                        maxHeight: '100%',
+                                        aspectRatio: `${BROWSER_VIEWPORT_WIDTH} / ${BROWSER_VIEWPORT_HEIGHT}`,
+                                        display: 'block',
+                                        cursor: 'pointer',
+                                        outline: 'none',
+                                        background: '#0a0a1a',
+                                    }}
+                                />
+                            </div>
                         ) : (
                             <div style={{
                                 display: 'flex', flexDirection: 'column', alignItems: 'center',
-                                justifyContent: 'center', height: '100%', gap: 16, color: '#1e293b',
+                                justifyContent: 'center', height: '100%', gap: 20,
                             }}>
-                                <div style={{ fontSize: 56, opacity: 0.15 }}>🌐</div>
-                                <p style={{ margin: 0, fontSize: 14, color: '#1e293b' }}>
-                                    {status === 'connected'
-                                        ? 'Speak to start searching for hotels'
-                                        : 'Connect to start'}
-                                </p>
-                                {status !== 'connected' && (
-                                    <p style={{ margin: 0, fontSize: 11, color: '#0f172a' }}>
-                                        Browser will open automatically when the bot searches
+                                <div style={{
+                                    fontSize: 64, opacity: 0.08,
+                                    animation: 'float 3s ease-in-out infinite',
+                                }}>🌐</div>
+                                <div style={{ textAlign: 'center' }}>
+                                    <p style={{
+                                        margin: '0 0 6px', fontSize: 16, fontWeight: 600,
+                                        color: '#334155',
+                                    }}>
+                                        {status === 'connected'
+                                            ? 'Speak to start searching'
+                                            : 'Connect to start'}
                                     </p>
-                                )}
+                                    <p style={{ margin: 0, fontSize: 12, color: '#1e293b' }}>
+                                        {status === 'connected'
+                                            ? 'The browser will open once the AI starts searching'
+                                            : 'Click the microphone button to initiate a voice command'}
+                                    </p>
+                                </div>
                             </div>
                         )}
 
@@ -598,28 +743,115 @@ export default function App() {
                         {isBrowserActive && !hasBrowserFrame && (
                             <div style={{
                                 position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
-                                alignItems: 'center', justifyContent: 'center', gap: 12,
-                                background: 'rgba(0,0,0,0.6)',
+                                alignItems: 'center', justifyContent: 'center', gap: 16,
+                                background: 'rgba(6, 6, 17, 0.85)',
+                                backdropFilter: 'blur(4px)',
                             }}>
-                                <div style={{ fontSize: 32, animation: 'spin 1s linear infinite' }}>⚙️</div>
-                                <p style={{ margin: 0, fontSize: 14, color: '#f59e0b' }}>Connecting to browser...</p>
-                                <p style={{ margin: 0, fontSize: 11, color: '#475569' }}>CDP Screencast streaming</p>
+                                {/* Spinning gear */}
+                                <div style={{
+                                    width: 56, height: 56, borderRadius: 14,
+                                    background: 'rgba(99, 102, 241, 0.1)',
+                                    border: '1px solid rgba(99, 102, 241, 0.2)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                }}>
+                                    <div style={{ fontSize: 28, animation: 'spin 1.5s linear infinite' }}>⚙️</div>
+                                </div>
+                                <div style={{ textAlign: 'center' }}>
+                                    <p style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600, color: '#e2e8f0' }}>
+                                        Connecting to browser...
+                                    </p>
+                                    <p style={{ margin: 0, fontSize: 12, color: '#64748b' }}>
+                                        Navigating to booking.com
+                                    </p>
+                                </div>
+
+                                {/* Protocol telemetry badges */}
+                                <div style={{
+                                    display: 'flex', gap: 12, marginTop: 8,
+                                }}>
+                                    {[
+                                        { label: 'Protocol', value: 'CDP Screencast', color: '#6366f1' },
+                                        { label: 'Transport', value: 'WebSocket', color: '#38bdf8' },
+                                        { label: 'Status', value: 'Handshake...', color: '#f59e0b' },
+                                    ].map(({ label, value, color }) => (
+                                        <div key={label} style={{
+                                            background: 'rgba(255, 255, 255, 0.03)',
+                                            border: '1px solid rgba(255, 255, 255, 0.06)',
+                                            borderRadius: 8, padding: '6px 12px',
+                                            textAlign: 'center',
+                                        }}>
+                                            <div style={{ fontSize: 9, color: '#475569', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 2 }}>
+                                                {label}
+                                            </div>
+                                            <div style={{ fontSize: 11, color, fontWeight: 600 }}>
+                                                {value}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+
+                                {/* Progress bar */}
+                                <div style={{
+                                    width: 200, height: 3, background: 'rgba(255, 255, 255, 0.05)',
+                                    borderRadius: 3, overflow: 'hidden', marginTop: 4,
+                                }}>
+                                    <div style={{
+                                        height: '100%', borderRadius: 3,
+                                        background: 'linear-gradient(90deg, #6366f1, #38bdf8)',
+                                        animation: 'loadBar 2s ease-in-out infinite',
+                                    }} />
+                                </div>
                             </div>
                         )}
+                    </div>
+
+                    {/* Bottom status bar */}
+                    <div style={{
+                        height: 28, minHeight: 28,
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        padding: '0 20px',
+                        background: 'rgba(10, 10, 22, 0.95)',
+                        borderTop: '1px solid rgba(99, 102, 241, 0.06)',
+                        fontSize: 10, color: '#334155',
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+                            <span>Powered by <strong style={{ color: '#475569' }}>Amazon Nova Sonic</strong></span>
+                            <span style={{ color: '#1e293b' }}>•</span>
+                            <span>Vision-driven automation</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                            {isBrowserActive && (
+                                <span style={{ color: '#38bdf8' }}>● Streaming</span>
+                            )}
+                            <span>v1.0</span>
+                        </div>
                     </div>
                 </div>
             </div>
 
             <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { margin: 0; overflow: hidden; }
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.3); border-radius: 4px; }
-        @keyframes ping { 0%,100%{transform:scale(1);opacity:.5}50%{transform:scale(1.15);opacity:.15} }
-        @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
-        @keyframes spin { from{transform:rotate(0deg)}to{transform:rotate(360deg)} }
-      `}</style>
+                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+                * { box-sizing: border-box; margin: 0; padding: 0; }
+                body { margin: 0; overflow: hidden; }
+                ::-webkit-scrollbar { width: 4px; }
+                ::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.25); border-radius: 4px; }
+                ::-webkit-scrollbar-track { background: transparent; }
+                @keyframes ping { 0%,100%{transform:scale(1);opacity:.4}50%{transform:scale(1.3);opacity:.08} }
+                @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+                @keyframes spin { from{transform:rotate(0deg)}to{transform:rotate(360deg)} }
+                @keyframes float { 0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)} }
+                @keyframes waveform {
+                    0%,100% { height: 4px; }
+                    25% { height: ${Math.random() * 12 + 6}px; }
+                    50% { height: ${Math.random() * 16 + 8}px; }
+                    75% { height: ${Math.random() * 10 + 4}px; }
+                }
+                @keyframes loadBar {
+                    0% { width: 0%; margin-left: 0; }
+                    50% { width: 70%; margin-left: 15%; }
+                    100% { width: 0%; margin-left: 100%; }
+                }
+            `}</style>
         </div>
     );
 }
