@@ -25,6 +25,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
 )
 from pipecat.transports.smallwebrtc.connection import IceServer
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService, Params as NovaSonicParams
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -33,11 +34,13 @@ from pipecat.frames.frames import LLMContextFrame
 from pipecat.frames.frames import (
     Frame,
     FunctionCallResultProperties,
+    LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
     TextFrame,
     TranscriptionFrame,
     TTSTextFrame,
+    UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
@@ -53,7 +56,16 @@ BROWSER_SERVICE_URL = os.getenv("BROWSER_SERVICE_URL", "http://localhost:7863")
 _http_session: aiohttp.ClientSession | None = None
 _inflight_browser_actions: dict[str, asyncio.Task] = {}
 _recent_browser_action_results: dict[str, tuple[float, dict]] = {}
-_BROWSER_ACTION_DEDUPE_TTL = 2.0
+# Keep a wider window to suppress repeated identical tool calls from the same user turn.
+_BROWSER_ACTION_DEDUPE_TTL = 15.0
+_DEFAULT_BROWSER_ACTION_TIMEOUT_SECS = 30
+_BROWSER_ACTION_TIMEOUT_SECS: dict[str, int] = {
+    "search_hotel": 35,
+    "select_hotel": 30,
+    "reserve_hotel": 32,
+    "fill_guest_info": 30,
+    "continue_to_payment": 25,
+}
 _READY_TOKEN_RE = re.compile(r"(?:(?<=^)|(?<=[\s,.;:!?-]))ready(?!\s+to\b)[.!?]?(?=$|[\s,.;:!?-])", re.IGNORECASE)
 _DIGIT_WORDS = {
     "zero": "0",
@@ -72,6 +84,42 @@ _DIGIT_WORDS = {
 _DIGIT_SEQUENCE_RE = re.compile(
     r"(?i)\b(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine)\b"
     r"(?:[\s,.;:\-]+\b(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine)\b){2,}"
+)
+_BOT_THINKING_RE = re.compile(
+    r"(?i)\b("
+    r"let me think(?: about it)?|"
+    r"i(?: am|'m) thinking|"
+    r"here(?:'s| is) (?:my )?(?:thinking|reasoning|thought process)|"
+    r"my (?:thinking|reasoning) is|"
+    r"let me reason(?: this)?(?: out)?|"
+    r"step by step(?: thinking)?"
+    r")\b[,.!?]*"
+)
+_BOT_META_SENTENCE_RE = re.compile(
+    r"(?i)\b("
+    r"the user|they provided|they mentioned|"
+    r"required fields?|all four required fields|"
+    r"destination is|checkin|checkout|check-in date is|check-out date is|"
+    r"adults?\s*=\s*\d+|children\s*=\s*\d+|rooms?\s*=\s*\d+|"
+    r"i need to (?:confirm|check|make sure)|"
+    r"i should|first,?\s*i need to|now,?\s*i should|"
+    r"let me check (?:the )?details|"
+    r"proceed to ask (?:that )?question|"
+    r"translates?\s+to"
+    r")\b"
+)
+_BOT_ASSIGNMENT_RE = re.compile(r"(?i)\b[a-z_]{2,24}\s*=\s*[\w\-:/.]+\b")
+_RESERVATION_INTENT_RE = re.compile(
+    r"\b(book|booking|reserve|reservation|proceed with booking|go ahead and book)\b",
+    re.IGNORECASE,
+)
+_CONTINUE_INTENT_RE = re.compile(
+    r"\b(continue|next|next page|go on|proceed|payment|pay|move on)\b",
+    re.IGNORECASE,
+)
+_SHORT_AFFIRMATIVE_RE = re.compile(
+    r"^\s*(yes|yeah|yep|sure|please do|go ahead|sounds good|do it|let's do it|lets do it)\s*[.!?]?\s*$",
+    re.IGNORECASE,
 )
 _latest_user_transcript: str = ""
 
@@ -105,12 +153,80 @@ def _clean_user_transcript_text(text: str) -> str:
     return cleaned.strip()
 
 
-def _user_explicitly_wants_reservation() -> bool:
-    return bool(re.search(r"\b(book|booking|reserve|reservation|proceed with booking|go ahead and book)\b", _latest_user_transcript, re.IGNORECASE))
+def _sanitize_bot_response_text(text: str) -> str:
+    cleaned = _BOT_THINKING_RE.sub(" ", text or "")
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+
+    kept_sentences: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", cleaned):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if _BOT_META_SENTENCE_RE.search(sentence):
+            continue
+        if _BOT_ASSIGNMENT_RE.search(sentence):
+            continue
+        kept_sentences.append(sentence)
+
+    result = " ".join(kept_sentences).strip()
+    if not result:
+        return ""
+
+    result = re.sub(r"\s+([,.;:!?])", r"\1", result)
+    result = re.sub(r"\s{2,}", " ", result)
+    return result.strip()
 
 
-def _user_explicitly_wants_to_continue() -> bool:
-    return bool(re.search(r"\b(continue|next|next page|go on|proceed|payment|pay|move on)\b", _latest_user_transcript, re.IGNORECASE))
+def _extract_text_from_context_message(message) -> str:
+    if not isinstance(message, dict):
+        return ""
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return " ".join(parts)
+
+    return ""
+
+
+def _latest_user_text_from_context(context) -> str:
+    if context is None or not hasattr(context, "messages"):
+        return ""
+
+    try:
+        messages = list(context.messages)
+    except Exception:
+        return ""
+
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            text = _clean_user_transcript_text(_extract_text_from_context_message(message))
+            if text:
+                return text
+    return ""
+
+
+def _is_short_affirmative(text: str) -> bool:
+    return bool(_SHORT_AFFIRMATIVE_RE.match((text or "").strip()))
+
+
+def _user_explicitly_wants_reservation(text: str = "") -> bool:
+    candidate = (text or _latest_user_transcript or "").strip()
+    return bool(_RESERVATION_INTENT_RE.search(candidate) or _is_short_affirmative(candidate))
+
+
+def _user_explicitly_wants_to_continue(text: str = "") -> bool:
+    candidate = (text or _latest_user_transcript or "").strip()
+    return bool(_CONTINUE_INTENT_RE.search(candidate) or _is_short_affirmative(candidate))
 
 # Global WebRTC request handler (manages all peer connections)
 webrtc_handler = SmallWebRTCRequestHandler(
@@ -185,18 +301,87 @@ class ConversationEventLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class BotResponseSanitizer(FrameProcessor):
+    """Removes accidental chain-of-thought style filler from spoken responses."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if (
+            direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, (LLMTextFrame, TTSTextFrame))
+            and frame.text
+        ):
+            sanitized = _sanitize_bot_response_text(frame.text)
+            if not sanitized:
+                return
+            frame.text = sanitized
+
+        await self.push_frame(frame, direction)
+
+
 class AssistantTurnTrigger(FrameProcessor):
     """Triggers Nova Sonic to answer when the user finishes speaking."""
 
     def __init__(self, llm):
         super().__init__()
         self._llm = llm
+        self._pending_user_turn = False
+        self._assistant_responding = False
+        self._awaiting_assistant_response = False
+        self._awaiting_response_since = 0.0
+        self._last_trigger_time = 0.0
+        self._trigger_debounce_secs = 0.9
+        self._awaiting_response_timeout_secs = 6.0
+
+    def _reset_awaiting_response_if_stale(self):
+        if not self._awaiting_assistant_response:
+            return
+        if (time.monotonic() - self._awaiting_response_since) >= self._awaiting_response_timeout_secs:
+            self._awaiting_assistant_response = False
+            self._awaiting_response_since = 0.0
+
+    async def _trigger_assistant(self, now: float):
+        self._pending_user_turn = False
+        self._last_trigger_time = now
+        self._awaiting_assistant_response = True
+        self._awaiting_response_since = now
+        await self._llm.trigger_assistant_response()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        self._reset_awaiting_response_if_stale()
 
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, UserStoppedSpeakingFrame):
-            await self._llm.trigger_assistant_response()
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, UserStartedSpeakingFrame):
+            self._pending_user_turn = True
+        elif direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseStartFrame):
+            self._assistant_responding = True
+            self._awaiting_assistant_response = False
+            self._awaiting_response_since = 0.0
+        elif direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
+            self._assistant_responding = False
+            if self._pending_user_turn and not self._awaiting_assistant_response:
+                now = time.monotonic()
+                if (now - self._last_trigger_time) >= self._trigger_debounce_secs:
+                    await self._trigger_assistant(now)
+        elif direction == FrameDirection.DOWNSTREAM and isinstance(frame, UserStoppedSpeakingFrame):
+            if not self._pending_user_turn:
+                await self.push_frame(frame, direction)
+                return
+
+            now = time.monotonic()
+            if self._assistant_responding:
+                await self.push_frame(frame, direction)
+                return
+            if self._awaiting_assistant_response:
+                await self.push_frame(frame, direction)
+                return
+            if (now - self._last_trigger_time) < self._trigger_debounce_secs:
+                self._pending_user_turn = False
+                await self.push_frame(frame, direction)
+                return
+
+            await self._trigger_assistant(now)
 
         await self.push_frame(frame, direction)
 
@@ -272,6 +457,7 @@ async def invoke_browser_action(action: str, args: dict, result_callback):
     await broadcast_event("tool_called", {"action": action, "args": args})
 
     async def run_browser_request():
+        timeout_secs = _BROWSER_ACTION_TIMEOUT_SECS.get(action, _DEFAULT_BROWSER_ACTION_TIMEOUT_SECS)
         try:
             session = await get_http_session()
             payload = {
@@ -282,7 +468,9 @@ async def invoke_browser_action(action: str, args: dict, result_callback):
             }
             logger.info(f"Forwarding action '{action}' to Browser Agent Service...")
             async with session.post(
-                f"{BROWSER_SERVICE_URL}/api/execute", json=payload, timeout=aiohttp.ClientTimeout(total=120)
+                f"{BROWSER_SERVICE_URL}/api/execute",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout_secs),
             ) as response:
                 result_json = await response.json()
                 if result_json.get("success"):
@@ -290,6 +478,14 @@ async def invoke_browser_action(action: str, args: dict, result_callback):
                     return {"success": True, "result": text_result}
                 err_msg = f"Browser agent error: {result_json.get('error', 'unknown')}"
                 return {"success": False, "error": err_msg}
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "error": (
+                    f"Browser action '{action}' timed out after {timeout_secs}s. "
+                    "Please retry or simplify the step."
+                ),
+            }
         except Exception as e:
             logger.error(f"Error calling Browser Service for action '{action}': {e}")
             return {"success": False, "error": f"Browser service unavailable: {str(e)}"}
@@ -317,48 +513,75 @@ async def invoke_browser_action(action: str, args: dict, result_callback):
         if current_task is task:
             _inflight_browser_actions.pop(fingerprint, None)
 
-async def search_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
+async def search_hotel_tool(params: FunctionCallParams):
     """Callback invoked when the LLM calls the 'search_hotel' tool."""
+    args = dict(params.arguments or {})
     logger.info(f"Tool 'search_hotel' called with args: {args}")
-    await invoke_browser_action("search_hotel", args, result_callback)
+    await invoke_browser_action("search_hotel", args, params.result_callback)
 
 
-async def select_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
+async def select_hotel_tool(params: FunctionCallParams):
     """Callback invoked when the LLM calls the 'select_hotel' tool."""
+    args = dict(params.arguments or {})
     logger.info(f"Tool 'select_hotel' called with args: {args}")
-    await invoke_browser_action("select_hotel", args, result_callback)
+    await invoke_browser_action("select_hotel", args, params.result_callback)
 
 
-async def reserve_hotel_tool(function_name, tool_call_id, args, llm, context, result_callback):
+async def reserve_hotel_tool(params: FunctionCallParams):
     """Callback invoked when the LLM calls the 'reserve_hotel' tool."""
+    global _latest_user_transcript
+    args = dict(params.arguments or {})
     logger.info(f"Tool 'reserve_hotel' called with args: {args}")
-    if not _user_explicitly_wants_reservation():
+    latest_user_text = _latest_user_text_from_context(params.context) or _latest_user_transcript
+    if latest_user_text:
+        _latest_user_transcript = latest_user_text
+    if not _user_explicitly_wants_reservation(latest_user_text):
+        # In some turns, tool invocation arrives a few milliseconds before the
+        # final transcription frame is committed. Re-check once to avoid
+        # skipping an explicit "yes/reserve" from the user.
+        await asyncio.sleep(0.18)
+        latest_user_text = _latest_user_text_from_context(params.context) or _latest_user_transcript
+        if latest_user_text:
+            _latest_user_transcript = latest_user_text
+    if not _user_explicitly_wants_reservation(latest_user_text):
         logger.info("Skipping reserve_hotel because the latest user utterance did not explicitly ask to book.")
-        await result_callback(
+        await params.result_callback(
             {"result": "The user has not explicitly asked to reserve the hotel yet."},
             properties=FunctionCallResultProperties(run_llm=False),
         )
         return
-    await invoke_browser_action("reserve_hotel", args, result_callback)
+    await invoke_browser_action("reserve_hotel", args, params.result_callback)
 
 
-async def fill_guest_info_tool(function_name, tool_call_id, args, llm, context, result_callback):
+async def fill_guest_info_tool(params: FunctionCallParams):
     """Callback invoked when the LLM calls the 'fill_guest_info' tool."""
+    args = dict(params.arguments or {})
     logger.info(f"Tool 'fill_guest_info' called with args: {args}")
-    await invoke_browser_action("fill_guest_info", args, result_callback)
+    await invoke_browser_action("fill_guest_info", args, params.result_callback)
 
 
-async def continue_to_payment_tool(function_name, tool_call_id, args, llm, context, result_callback):
+async def continue_to_payment_tool(params: FunctionCallParams):
     """Callback invoked when the LLM calls the 'continue_to_payment' tool."""
+    global _latest_user_transcript
+    args = dict(params.arguments or {})
     logger.info(f"Tool 'continue_to_payment' called with args: {args}")
-    if not _user_explicitly_wants_to_continue():
+    latest_user_text = _latest_user_text_from_context(params.context) or _latest_user_transcript
+    if latest_user_text:
+        _latest_user_transcript = latest_user_text
+    if not _user_explicitly_wants_to_continue(latest_user_text):
+        # Same race as reserve flow: wait briefly for the latest user transcript.
+        await asyncio.sleep(0.18)
+        latest_user_text = _latest_user_text_from_context(params.context) or _latest_user_transcript
+        if latest_user_text:
+            _latest_user_transcript = latest_user_text
+    if not _user_explicitly_wants_to_continue(latest_user_text):
         logger.info("Skipping continue_to_payment because the latest user utterance did not explicitly ask to continue.")
-        await result_callback(
+        await params.result_callback(
             {"result": "The user has not explicitly asked to continue to the next step yet."},
             properties=FunctionCallResultProperties(run_llm=False),
         )
         return
-    await invoke_browser_action("continue_to_payment", args, result_callback)
+    await invoke_browser_action("continue_to_payment", args, params.result_callback)
 
 
 
@@ -471,12 +694,11 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
                     confidence=0.65,
                     start_secs=0.12,
-                    stop_secs=0.25,
+                    stop_secs=0.4,
                     min_volume=0.45,
                 )
             ),
@@ -496,6 +718,7 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
             AssistantTurnTrigger(llm),
             ConversationEventLogger(capture_user=True),
             llm,                         # Nova Sonic S2S handles audio directly
+            BotResponseSanitizer(),
             ConversationEventLogger(capture_bot=True),
             transport.output(),
             context_aggregator.assistant(),  # keeps conversation history
@@ -514,9 +737,16 @@ async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
     @transport.event_handler("on_client_connected")
     async def on_connected(*args, **kwargs):
         logger.info("Client connected — pushing initial context to unblock Nova Sonic.")
-        # ⚡ Push an empty LLMContextFrame so Nova Sonic can finish its setup
-        # (open audio input, start receive loop) without waiting for the first user utterance.
-        await task.queue_frames([LLMContextFrame(context=context)])
+        # Push initial context on the next loop tick so all processor tasks are fully
+        # initialized before the first queued frame.
+        async def _push_initial_context():
+            await asyncio.sleep(0.05)
+            try:
+                await task.queue_frames([LLMContextFrame(context=context)])
+            except Exception as exc:
+                logger.warning(f"Unable to queue initial context frame: {exc}")
+
+        asyncio.create_task(_push_initial_context())
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(*args, **kwargs):

@@ -1,8 +1,10 @@
 import asyncio
 import base64
-from urllib.parse import urlencode
+import re
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from loguru import logger
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 try:
@@ -45,6 +47,45 @@ class BookingAgent:
         except Exception:
             pass
 
+    async def _goto_with_fallback(self, url: str, timeout_ms: int = 60000):
+        if not self.page:
+            return
+
+        url = self._force_us_language_url(url)
+
+        try:
+            await self.page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            return
+        except PlaywrightTimeoutError:
+            current_url = self.page.url or ""
+            if current_url and current_url != "about:blank":
+                logger.warning(
+                    f"Navigation hit timeout at domcontentloaded for {url}; "
+                    f"continuing on current URL: {current_url}"
+                )
+                return
+            logger.warning(
+                f"Navigation hit timeout at domcontentloaded for {url}; retrying with wait_until='commit'."
+            )
+
+        await self.page.goto(url, wait_until="commit", timeout=min(timeout_ms, 20000))
+
+    @staticmethod
+    def _force_us_language_url(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            if not parsed.scheme or not parsed.netloc:
+                return url
+
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            pairs = [(k, v) for (k, v) in pairs if k not in {"lang", "lang_changed"}]
+            pairs.append(("lang", "en-us"))
+            pairs.append(("lang_changed", "1"))
+            new_query = urlencode(pairs, doseq=True)
+            return urlunparse(parsed._replace(query=new_query))
+        except Exception:
+            return url
+
     async def _ensure_booking_session_page(self):
         if not self.page:
             return
@@ -54,7 +95,10 @@ class BookingAgent:
             return
 
         logger.info("Opening Booking.com in the current session...")
-        await self.page.goto("https://www.booking.com", timeout=60000)
+        await self._goto_with_fallback(
+            "https://www.booking.com/index.html?aid=304142&label=gen173bo-10CAEoggI46AdIKlgDaPQBiAEBmAEzuAEXyAEM2AED6AEB-AEBiAIBmAICqAIBuAKLx9TNBsACAdICJDdkODY5MGFmLTM4OTgtNGI5OS05ZjljLTllYjgzNTViNmYwN9gCAeACAQ&lang=en-us&soz=1&lang_changed=1",
+            timeout_ms=60000,
+        )
         await self._wait_brief_navigation()
         await self.page.wait_for_timeout(500)
         await self._dismiss_overlays()
@@ -301,6 +345,7 @@ class BookingAgent:
                         && style.visibility !== 'hidden'
                         && style.opacity !== '0'
                         && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    const fieldContainer = el.closest('[data-testid*="container"], .form-group, .bui-field, .c-form-group, .book-form-group') || el.parentElement;
 
                     const labels = [];
                     if (el.labels) {
@@ -323,6 +368,9 @@ class BookingAgent:
                             labels.push(node.innerText || '');
                         }
                     }
+                    const labelText = clean(labels.join(' '));
+                    const containerText = clean(fieldContainer ? fieldContainer.innerText || '' : '');
+                    const hasRequiredMarker = /\\*/.test(labelText) || /\\*/.test(containerText);
 
                     return {
                         index,
@@ -330,11 +378,13 @@ class BookingAgent:
                         type: (el.getAttribute('type') || '').toLowerCase(),
                         name: el.getAttribute('name') || '',
                         id: el.id || '',
+                        dataTestId: el.getAttribute('data-testid') || '',
                         placeholder: el.getAttribute('placeholder') || '',
                         ariaLabel: el.getAttribute('aria-label') || '',
                         autocomplete: el.getAttribute('autocomplete') || '',
-                        label: clean(labels.join(' ')),
-                        required: !!(el.required || el.getAttribute('required') !== null || el.getAttribute('aria-required') === 'true'),
+                        label: labelText,
+                        containerText,
+                        required: !!(el.required || el.getAttribute('required') !== null || el.getAttribute('aria-required') === 'true' || hasRequiredMarker),
                         value: 'value' in el ? String(el.value || '') : '',
                         checked: 'checked' in el ? !!el.checked : false,
                         visible,
@@ -360,6 +410,19 @@ class BookingAgent:
             return parts[0], ""
         return parts[0], " ".join(parts[1:])
 
+    @staticmethod
+    def _to_name_case(value: str) -> str:
+        text = " ".join((value or "").split()).strip()
+        if not text:
+            return ""
+        # Keep separators but normalize each word-like chunk to title case.
+        return re.sub(
+            r"[^\W\d_]+(?:'[^\W\d_]+)?",
+            lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(),
+            text,
+            flags=re.UNICODE,
+        )
+
     def _merge_guest_info(self, **kwargs) -> dict[str, str]:
         guest_info = dict(self._last_guest_info)
         for key, value in kwargs.items():
@@ -368,6 +431,10 @@ class BookingAgent:
             text = str(value).strip()
             if text:
                 guest_info[key] = text
+
+        for name_key in ("full_name", "first_name", "last_name"):
+            if guest_info.get(name_key):
+                guest_info[name_key] = self._to_name_case(guest_info[name_key])
 
         if guest_info.get("full_name") and (not guest_info.get("first_name") or not guest_info.get("last_name")):
             first_name, last_name = self._split_full_name(guest_info["full_name"])
@@ -386,32 +453,86 @@ class BookingAgent:
     def _control_descriptor(control: dict) -> str:
         return " ".join(
             str(control.get(key, "") or "")
-            for key in ("label", "name", "id", "placeholder", "ariaLabel", "autocomplete", "type")
+            for key in ("label", "name", "id", "dataTestId", "placeholder", "ariaLabel", "autocomplete", "type")
         ).lower()
 
     @staticmethod
     def _is_required_control(control: dict) -> bool:
         text = " ".join(
             str(control.get(key, "") or "")
-            for key in ("label", "placeholder", "ariaLabel", "name")
+            for key in ("label", "placeholder", "ariaLabel", "name", "containerText")
         )
-        return bool(control.get("required")) or "*" in text
+        text_lower = text.lower()
+        return bool(control.get("required")) or "*" in text or "required" in text_lower or "mandatory" in text_lower
 
     def _standard_field_key_for_control(self, control: dict) -> str | None:
         text = self._control_descriptor(control)
+        container_text = self._clean_text(str(control.get("containerText", "") or "")).lower()
+        combined_text = f"{text} {container_text}".strip()
         field_type = (control.get("type") or "").lower()
         tag = (control.get("tag") or "").lower()
+        name = str(control.get("name", "") or "").lower()
+        data_test_id = str(control.get("dataTestId", "") or "").lower()
+        input_id = str(control.get("id", "") or "").lower()
+        autocomplete = str(control.get("autocomplete", "") or "").lower()
+        key_text = " ".join((name, data_test_id, input_id, autocomplete))
 
         if field_type in ("hidden", "submit", "button", "search", "reset", "file"):
             return None
+
+        if tag == "select" and any(
+            token in key_text for token in (
+                "phone-country-code",
+                "country-code-select",
+                "countrycode",
+                "tel-country-code",
+                "phone-country",
+                "dial-code",
+                "calling-code",
+            )
+        ):
+            return "phone_country_code"
+
+        if any(
+            token in key_text for token in (
+                "phone-number",
+                "phonenumber",
+                "tel-national",
+                "telnational",
+            )
+        ):
+            return "phone"
+
+        if autocomplete in ("tel", "tel-national", "tel-local"):
+            return "phone"
+
+        if field_type == "tel":
+            return "phone"
+
+        if field_type == "email" or autocomplete == "email":
+            return "email"
+
         if "email" in text:
             return "email"
+
         if tag == "select" and any(
-            token in text for token in ("phone", "mobile", "telephone", "tel", "dial code", "calling code", "country code")
+            token in text for token in (
+                "phone",
+                "mobile",
+                "telephone",
+                "tel",
+                "dial code",
+                "calling code",
+                "country code",
+                "countrycode",
+                "tel-country-code",
+                "phone-country-code",
+            )
         ):
             return "phone_country_code"
         if any(token in text for token in ("phone", "mobile", "telephone", "tel")):
             return "phone"
+
         if any(token in text for token in ("first name", "firstname", "given name", "given_name")):
             return "first_name"
         if any(token in text for token in ("last name", "lastname", "surname", "family name", "family_name")):
@@ -426,15 +547,56 @@ class BookingAgent:
             return "full_name"
         if any(token in text for token in ("region", "country")) and tag == "select":
             return "region"
-        if any(token in text for token in ("arrival", "check-in time", "arrival time")):
+        if any(token in combined_text for token in ("arrival", "check-in time", "arrival time")):
             return "arrival_time"
-        if tag == "textarea" and any(token in text for token in ("special request", "special requirement", "message", "note")):
+        if tag == "textarea" and any(token in combined_text for token in ("special request", "special requirement", "message", "note")):
             return "special_requests"
         if "name" in text and "user" not in text and "email" not in text and "phone" not in text:
             return "full_name"
         return None
 
-    async def _fill_control(self, control: dict, value: str) -> bool:
+    @staticmethod
+    def _digits_only(value: str) -> str:
+        return "".join(ch for ch in (value or "") if ch.isdigit())
+
+    @staticmethod
+    def _normalize_option_text(value: str) -> str:
+        text = (value or "").lower()
+        text = "".join(ch for ch in text if ch.isalnum())
+        return text
+
+    def _allow_duplicate_key_fill(self, key: str, control: dict) -> bool:
+        # Some booking forms have multiple required controls for the same semantic key
+        # (for example multiple email inputs). Fill each required one.
+        return self._is_required_control(control) and key in ("email", "phone")
+
+    def _is_value_already_filled(self, key: str, current_value: str, desired_value: str) -> bool:
+        current = self._clean_text(current_value).lower()
+        desired = self._clean_text(desired_value).lower()
+        if not current:
+            return False
+        if not desired:
+            return True
+
+        if key == "phone":
+            current_digits = self._digits_only(current)
+            desired_digits = self._digits_only(desired)
+            return bool(current_digits and desired_digits and current_digits == desired_digits)
+
+        if key == "phone_country_code":
+            current_digits = self._digits_only(current)
+            desired_digits = self._digits_only(desired)
+            if desired_digits and current_digits and desired_digits == current_digits:
+                return True
+            return desired in current or current in desired
+
+        if key in ("region", "arrival_time"):
+            return desired in current or current in desired
+
+        # Keep existing behavior for other fields: if something is already there, do not overwrite.
+        return True
+
+    async def _fill_control(self, control: dict, value: str, key: str | None = None) -> bool:
         locator = self.page.locator("input, textarea, select").nth(int(control["index"]))
         await locator.scroll_into_view_if_needed(timeout=1200)
 
@@ -443,10 +605,42 @@ class BookingAgent:
         if tag == "select":
             options = control.get("options") or []
             lower_value = value.lower()
-            for option in options:
+            normalized_value = self._normalize_option_text(lower_value)
+
+            def option_text(option: dict) -> tuple[str, str, str, str]:
                 option_label = str(option.get("label", "")).lower()
                 option_value = str(option.get("value", "")).lower()
-                if lower_value == option_label or lower_value == option_value or lower_value in option_label:
+                normalized_label = self._normalize_option_text(option_label)
+                normalized_option_value = self._normalize_option_text(option_value)
+                return option_label, option_value, normalized_label, normalized_option_value
+
+            def is_placeholder_option(option: dict) -> bool:
+                option_label, option_value, normalized_label, normalized_option_value = option_text(option)
+                text = f"{option_label} {option_value}".strip()
+                normalized_text = f"{normalized_label} {normalized_option_value}".strip()
+                return any(
+                    token in text or token in normalized_text
+                    for token in (
+                        "select",
+                        "choose",
+                        "chọn",
+                        "chon",
+                        "vui lòng",
+                        "not specified",
+                        "none",
+                    )
+                )
+
+            for option in options:
+                option_label, option_value, normalized_label, normalized_option_value = option_text(option)
+                if (
+                    lower_value == option_label
+                    or lower_value == option_value
+                    or lower_value in option_label
+                    or lower_value in option_value
+                    or (normalized_value and normalized_value in normalized_label)
+                    or (normalized_value and normalized_value in normalized_option_value)
+                ):
                     if option.get("value"):
                         await locator.select_option(value=option["value"], timeout=1200)
                     elif option.get("label"):
@@ -454,6 +648,56 @@ class BookingAgent:
                     else:
                         return False
                     return True
+
+            # Fallback matching for fields that frequently vary in label formatting.
+            best_option: dict | None = None
+            best_score = 0
+            desired_digits = self._digits_only(lower_value)
+            desired_parts = [part for part in re.findall(r"[a-z0-9]+", lower_value) if len(part) >= 2]
+            desired_time_parts = re.findall(r"\d{1,2}(?::\d{2})?", lower_value)
+            for option in options:
+                if is_placeholder_option(option):
+                    continue
+                option_label, option_value, normalized_label, normalized_option_value = option_text(option)
+                combined = f"{option_label} {option_value}".strip()
+                combined_normalized = f"{normalized_label} {normalized_option_value}".strip()
+                score = 0
+
+                if normalized_value and (
+                    normalized_value in combined_normalized or combined_normalized in normalized_value
+                ):
+                    score += 8
+
+                if key == "phone_country_code":
+                    option_digits = self._digits_only(combined)
+                    if desired_digits and option_digits and (
+                        desired_digits == option_digits
+                        or option_digits.endswith(desired_digits)
+                        or desired_digits.endswith(option_digits)
+                    ):
+                        score += 12
+                elif key == "arrival_time":
+                    for token in desired_time_parts:
+                        if token and token in combined:
+                            score += 4
+
+                for part in desired_parts:
+                    if part in combined:
+                        score += 1
+
+                if score > best_score:
+                    best_score = score
+                    best_option = option
+
+            if best_option and best_score > 0:
+                if best_option.get("value"):
+                    await locator.select_option(value=best_option["value"], timeout=1200)
+                elif best_option.get("label"):
+                    await locator.select_option(label=best_option["label"], timeout=1200)
+                else:
+                    return False
+                return True
+
             return False
 
         if field_type in ("checkbox", "radio"):
@@ -622,7 +866,7 @@ class BookingAgent:
             "last_name": "full name",
             "email": "email",
             "phone": "phone number",
-            "phone_country_code": "",
+            "phone_country_code": "phone country code",
             "region": "region",
             "address_line1": "address line 1",
             "address_line2": "address line 2",
@@ -644,6 +888,7 @@ class BookingAgent:
         ordered_labels = (
             "full name",
             "email",
+            "phone country code",
             "region",
             "phone number",
             "address line 1",
@@ -661,7 +906,7 @@ class BookingAgent:
             "last_name": "full name",
             "email": "email",
             "phone": "phone number",
-            "phone_country_code": "",
+            "phone_country_code": "phone country code",
             "region": "region",
             "address_line1": "address line 1",
             "address_line2": "address line 2",
@@ -687,9 +932,15 @@ class BookingAgent:
             if field_type in ("checkbox", "radio") and control.get("checked"):
                 continue
             if tag == "select" and current_value:
-                continue
+                lower_value = current_value.lower()
+                if not any(token in lower_value for token in ("select", "choose", "chọn")):
+                    continue
             if tag in ("input", "textarea") and current_value:
-                continue
+                if key == "phone":
+                    if len(self._digits_only(current_value)) >= 6:
+                        continue
+                else:
+                    continue
 
             if label not in missing:
                 missing.append(label)
@@ -697,6 +948,7 @@ class BookingAgent:
         ordered_labels = (
             "full name",
             "email",
+            "phone country code",
             "region",
             "phone number",
             "address line 1",
@@ -706,35 +958,68 @@ class BookingAgent:
         )
         return [label for label in ordered_labels if label in missing]
 
-    async def _scroll_to_guest_form(self) -> bool:
+    async def _scroll_to_guest_form(self, max_rounds: int = 10) -> bool:
         selectors = [
+            'input[data-testid="phone-number-input"]',
+            'select[data-testid="phone-country-code-select"]',
+            'select[data-testid="country-code-select"]',
+            'input[name*="first" i]',
+            'input[name*="last" i]',
+            'input[name*="email" i]',
+            'input[name*="phone" i]',
+            'select[name*="country" i]',
+            'select[name*="region" i]',
+            'select[name*="arrival" i]',
+            'input[autocomplete="name"]',
+            'input[autocomplete="given-name"]',
+            'input[autocomplete="family-name"]',
+            'input[autocomplete="email"]',
+            'input[autocomplete="tel"]',
+            'input[autocomplete="street-address"]',
             'input[name*="firstname"]',
+            'input[name*="first_name"]',
             'input[name*="last"]',
+            'input[name*="surname"]',
             'input[name*="email"]',
             'input[type="email"]',
             'input[name*="phone"]',
             'input[type="tel"]',
+            'select[name*="country"]',
+            'select[name*="region"]',
+            'select[name*="phone"]',
+            'select[name*="arrival"]',
+            'textarea[name*="request"]',
+            'textarea[name*="message"]',
             'input[name*="card"]',
-            'form',
+            'form input',
+            'form select',
+            'form textarea',
         ]
-        
-        try:
-            combined_selector = ", ".join(selectors)
-            await self.page.wait_for_selector(combined_selector, state="attached", timeout=1200)
-        except Exception:
-            pass
 
-        for selector in selectors:
-            try:
-                locator = self.page.locator(selector).first
-                if await locator.count() == 0:
+        max_rounds = max(1, min(max_rounds, 30))
+        for _ in range(max_rounds):
+            for selector in selectors:
+                try:
+                    locator = self.page.locator(selector)
+                    if await locator.count() == 0:
+                        continue
+                    target = locator.first
+                    await target.scroll_into_view_if_needed(timeout=700)
+                    await self.page.wait_for_timeout(220)
+                    logger.info(f"Scrolled to guest form via {selector}")
+                    return True
+                except Exception:
                     continue
-                await locator.scroll_into_view_if_needed(timeout=500)
-                await self.page.wait_for_timeout(150)
-                logger.info(f"Scrolled to guest form via {selector}")
-                return True
+
+            try:
+                previous_scroll_y = await self.page.evaluate("() => window.scrollY")
+                await self.page.evaluate("() => window.scrollBy(0, Math.min(window.innerHeight * 0.9, 900))")
+                await self.page.wait_for_timeout(280)
+                current_scroll_y = await self.page.evaluate("() => window.scrollY")
+                if current_scroll_y == previous_scroll_y:
+                    break
             except Exception:
-                continue
+                break
         return False
 
     async def _open_hotel_from_results(self, hotel_name: str = "", hotel_index: int | None = None) -> str:
@@ -783,7 +1068,7 @@ class BookingAgent:
                     continue
                 detail_url = href if href.startswith("http") else f"https://www.booking.com{href}"
                 logger.info(f"Opening hotel detail in current tab: {detail_url}")
-                await self.page.goto(detail_url, timeout=60000)
+                await self._goto_with_fallback(detail_url, timeout_ms=60000)
                 await self._wait_brief_navigation()
                 await self.page.wait_for_timeout(350)
                 await self._dismiss_overlays()
@@ -810,12 +1095,29 @@ class BookingAgent:
         )
         self.context = await self.browser.new_context(
             viewport={"width": 1280, "height": 800},
+            locale="en-US",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+            },
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
+        try:
+            await self.context.add_cookies(
+                [
+                    {
+                        "name": "lang",
+                        "value": "en-us",
+                        "domain": ".booking.com",
+                        "path": "/",
+                    }
+                ]
+            )
+        except Exception:
+            pass
 
         await self.context.add_init_script(
             """
@@ -842,6 +1144,14 @@ class BookingAgent:
             return
         logger.info("[NewTab] Detected new tab - switching context")
         await new_page.wait_for_load_state("domcontentloaded")
+        try:
+            current_url = new_page.url or ""
+            if "booking.com" in current_url:
+                forced_url = self._force_us_language_url(current_url)
+                if forced_url != current_url:
+                    await new_page.goto(forced_url, wait_until="domcontentloaded", timeout=20000)
+        except Exception:
+            pass
         old_page = self.page
         self.page = new_page
 
@@ -1037,6 +1347,8 @@ class BookingAgent:
 
         try:
             query_params: list[tuple[str, str | int]] = [
+                ("lang", "en-us"),
+                ("lang_changed", "1"),
                 ("ss", destination),
                 ("checkin", checkin),
                 ("checkout", checkout),
@@ -1053,7 +1365,7 @@ class BookingAgent:
             )
 
             logger.info(f"Navigating directly to search results: {search_url}")
-            await self.page.goto(search_url, timeout=60000)
+            await self._goto_with_fallback(search_url, timeout_ms=60000)
             await self._wait_brief_navigation()
             await self.page.wait_for_timeout(300)
             await self._dismiss_overlays()
@@ -1196,7 +1508,11 @@ class BookingAgent:
 
                 # We will no longer click the second confirmation button here.
                 # It will be done after filling out the form.
-            form_visible = await self._scroll_to_guest_form()
+            form_visible = await self._scroll_to_guest_form(max_rounds=5)
+            if not form_visible:
+                await self.page.wait_for_timeout(900)
+                await self._dismiss_overlays()
+                form_visible = await self._scroll_to_guest_form(max_rounds=7)
             required_fields = await self._collect_guest_fields(required_only=True)
             optional_fields = await self._collect_guest_fields(required_only=False)
             special_questions = await self._collect_special_form_questions()
@@ -1277,7 +1593,7 @@ class BookingAgent:
                 "last_name": "full name",
                 "email": "email",
                 "phone": "phone number",
-                "phone_country_code": "",
+                "phone_country_code": "phone country code",
                 "region": "region",
                 "address_line1": "address line 1",
                 "address_line2": "address line 2",
@@ -1288,24 +1604,28 @@ class BookingAgent:
 
             for control in controls:
                 key = self._standard_field_key_for_control(control)
-                if not key or key in seen_keys:
+                if not key:
+                    continue
+                if key in seen_keys and not self._allow_duplicate_key_fill(key, control):
                     continue
                 value = guest_info.get(key, "").strip()
                 if not value:
                     continue
                 current_value = str(control.get("value", "") or "").strip()
-                if current_value and key != "special_requests":
-                    seen_keys.add(key)
+                if current_value and key != "special_requests" and self._is_value_already_filled(key, current_value, value):
+                    if not self._allow_duplicate_key_fill(key, control):
+                        seen_keys.add(key)
                     continue
                 try:
-                    filled = await self._fill_control(control, value)
+                    filled = await self._fill_control(control, value, key=key)
                 except Exception:
                     filled = False
                 if filled:
                     label = display_labels.get(key, self._clean_text(str(control.get("label") or control.get("name") or key)))
                     if label and label not in filled_labels:
                         filled_labels.append(label)
-                    seen_keys.add(key)
+                    if not self._allow_duplicate_key_fill(key, control):
+                        seen_keys.add(key)
 
             self._last_guest_info = guest_info
             selected_options = await self._apply_optional_choices(optional_choices or [])

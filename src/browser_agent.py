@@ -74,7 +74,12 @@ class BrowserAgentHandler:
                 if session.is_cdp_connected:
                     png = await session.take_screenshot()
                     if png:
-                        self._latest_screenshot = png
+                        # browser-use returns base64 string; decode to raw PNG bytes
+                        if isinstance(png, str):
+                            import base64
+                            self._latest_screenshot = base64.b64decode(png)
+                        else:
+                            self._latest_screenshot = png
             except asyncio.CancelledError:
                 break
             except Exception:
