@@ -56,15 +56,22 @@ BROWSER_SERVICE_URL = os.getenv("BROWSER_SERVICE_URL", "http://localhost:7863")
 _http_session: aiohttp.ClientSession | None = None
 _inflight_browser_actions: dict[str, asyncio.Task] = {}
 _recent_browser_action_results: dict[str, tuple[float, dict]] = {}
+_inflight_browser_actions_by_type: dict[str, asyncio.Task] = {}
+_recent_action_completion: dict[str, float] = {}
 # Keep a wider window to suppress repeated identical tool calls from the same user turn.
 _BROWSER_ACTION_DEDUPE_TTL = 15.0
-_DEFAULT_BROWSER_ACTION_TIMEOUT_SECS = 30
+_ACTION_LEVEL_DEDUPE_TTL: dict[str, float] = {
+    "select_hotel": 6.0,
+    "reserve_hotel": 8.0,
+}
+_DEFAULT_BROWSER_ACTION_TIMEOUT_SECS = 60
 _BROWSER_ACTION_TIMEOUT_SECS: dict[str, int] = {
-    "search_hotel": 35,
-    "select_hotel": 30,
-    "reserve_hotel": 32,
-    "fill_guest_info": 30,
-    "continue_to_payment": 25,
+    # Keep these comfortably above real-world Booking.com navigation latency.
+    "search_hotel": 70,
+    "select_hotel": 75,
+    "reserve_hotel": 90,
+    "fill_guest_info": 60,
+    "continue_to_payment": 60,
 }
 _READY_TOKEN_RE = re.compile(r"(?:(?<=^)|(?<=[\s,.;:!?-]))ready(?!\s+to\b)[.!?]?(?=$|[\s,.;:!?-])", re.IGNORECASE)
 _DIGIT_WORDS = {
@@ -121,7 +128,23 @@ _SHORT_AFFIRMATIVE_RE = re.compile(
     r"^\s*(yes|yeah|yep|sure|please do|go ahead|sounds good|do it|let's do it|lets do it)\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
+_DEMO_MOCK_FILL_TRIGGER_RE = re.compile(
+    r"\b(done|finished|that's all|thats all|all set|xong|xong roi|xong rồi|hoan tat|hoàn tất)\b",
+    re.IGNORECASE,
+)
+_DEMO_MOCK_GUEST_ENABLED = os.getenv("DEMO_MOCK_GUEST_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+_DEMO_MOCK_GUEST_ALWAYS = os.getenv("DEMO_MOCK_GUEST_ALWAYS", "0").strip().lower() in {"1", "true", "yes", "on"}
+_DEMO_MOCK_GUEST_PROFILE = {
+    "full_name": os.getenv("DEMO_MOCK_FULL_NAME", "Stephen Mark").strip() or "Stephen Mark",
+    "email": os.getenv("DEMO_MOCK_EMAIL", "stephen@gmail.com").strip() or "stephen@gmail.com",
+    "region": os.getenv("DEMO_MOCK_REGION", "Viet Nam").strip() or "Viet Nam",
+    "city": os.getenv("DEMO_MOCK_CITY", "Ho Chi Minh City").strip() or "Ho Chi Minh City",
+    "address_line1": os.getenv("DEMO_MOCK_ADDRESS_LINE1", "Ben Thanh Ward").strip() or "Ben Thanh Ward",
+    "phone": os.getenv("DEMO_MOCK_PHONE", "0912345678").strip() or "0912345678",
+}
 _latest_user_transcript: str = ""
+_reserve_action_task: asyncio.Task | None = None
+_last_reserve_outcome: dict | None = None
 
 # Screenshot cache to avoid hammering browser service
 _screenshot_cache: bytes | None = None
@@ -227,6 +250,26 @@ def _user_explicitly_wants_reservation(text: str = "") -> bool:
 def _user_explicitly_wants_to_continue(text: str = "") -> bool:
     candidate = (text or _latest_user_transcript or "").strip()
     return bool(_CONTINUE_INTENT_RE.search(candidate) or _is_short_affirmative(candidate))
+
+
+def _should_apply_demo_mock_guest_info(latest_user_text: str, args: dict) -> bool:
+    if not _DEMO_MOCK_GUEST_ENABLED:
+        return False
+    if _DEMO_MOCK_GUEST_ALWAYS:
+        return True
+
+    user_text = (latest_user_text or "").strip()
+    if user_text and _DEMO_MOCK_FILL_TRIGGER_RE.search(user_text):
+        return True
+    return False
+
+
+def _apply_demo_mock_guest_info(args: dict) -> dict:
+    merged = dict(args or {})
+    for key, value in _DEMO_MOCK_GUEST_PROFILE.items():
+        if not str(merged.get(key, "")).strip():
+            merged[key] = value
+    return merged
 
 # Global WebRTC request handler (manages all peer connections)
 webrtc_handler = SmallWebRTCRequestHandler(
@@ -432,6 +475,7 @@ class ResilientAWSNovaSonicLLMService(AWSNovaSonicLLMService):
 
 
 async def invoke_browser_action(action: str, args: dict, result_callback):
+    global _reserve_action_task, _last_reserve_outcome
     fingerprint = _browser_action_fingerprint(action, args)
     now = time.monotonic()
     cached = _recent_browser_action_results.get(fingerprint)
@@ -452,6 +496,27 @@ async def invoke_browser_action(action: str, args: dict, result_callback):
             properties=FunctionCallResultProperties(run_llm=False),
         )
         return
+
+    action_level_ttl = _ACTION_LEVEL_DEDUPE_TTL.get(action, 0.0)
+    if action_level_ttl > 0:
+        action_inflight = _inflight_browser_actions_by_type.get(action)
+        if action_inflight and not action_inflight.done():
+            logger.info(f"Joining in-flight '{action}' action-level duplicate call.")
+            await action_inflight
+            await result_callback(
+                {"duplicate_tool_call": True},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+
+        last_completed = _recent_action_completion.get(action)
+        if last_completed and (now - last_completed) <= action_level_ttl:
+            logger.info(f"Dropping near-duplicate '{action}' call within action-level cooldown.")
+            await result_callback(
+                {"duplicate_tool_call": True},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
 
     session_id = str(uuid.uuid4())
     await broadcast_event("tool_called", {"action": action, "args": args})
@@ -491,11 +556,20 @@ async def invoke_browser_action(action: str, args: dict, result_callback):
             return {"success": False, "error": f"Browser service unavailable: {str(e)}"}
 
     task = asyncio.create_task(run_browser_request())
+    if action == "reserve_hotel":
+        _reserve_action_task = task
+        _last_reserve_outcome = None
     _inflight_browser_actions[fingerprint] = task
+    if action_level_ttl > 0:
+        _inflight_browser_actions_by_type[action] = task
 
     try:
         outcome = await task
+        if action == "reserve_hotel":
+            _last_reserve_outcome = outcome
         _recent_browser_action_results[fingerprint] = (time.monotonic(), outcome)
+        if action_level_ttl > 0:
+            _recent_action_completion[action] = time.monotonic()
         if outcome.get("success"):
             await broadcast_event("tool_result", {"action": action, "result": outcome["result"]})
             await result_callback(
@@ -512,6 +586,11 @@ async def invoke_browser_action(action: str, args: dict, result_callback):
         current_task = _inflight_browser_actions.get(fingerprint)
         if current_task is task:
             _inflight_browser_actions.pop(fingerprint, None)
+        current_by_action = _inflight_browser_actions_by_type.get(action)
+        if current_by_action is task:
+            _inflight_browser_actions_by_type.pop(action, None)
+        if action == "reserve_hotel" and _reserve_action_task is task:
+            _reserve_action_task = None
 
 async def search_hotel_tool(params: FunctionCallParams):
     """Callback invoked when the LLM calls the 'search_hotel' tool."""
@@ -555,7 +634,57 @@ async def reserve_hotel_tool(params: FunctionCallParams):
 
 async def fill_guest_info_tool(params: FunctionCallParams):
     """Callback invoked when the LLM calls the 'fill_guest_info' tool."""
+    global _latest_user_transcript, _reserve_action_task, _last_reserve_outcome
     args = dict(params.arguments or {})
+    latest_user_text = _latest_user_text_from_context(params.context) or _latest_user_transcript
+    if latest_user_text:
+        _latest_user_transcript = latest_user_text
+
+    # Prevent race: if reservation flow is still opening, wait for it before filling.
+    if _reserve_action_task and not _reserve_action_task.done():
+        logger.info("fill_guest_info called while reserve_hotel is still running; waiting for reserve result.")
+        try:
+            await _reserve_action_task
+        except Exception:
+            pass
+
+    reserve_outcome = _last_reserve_outcome or {}
+    if reserve_outcome:
+        reserve_text = str(reserve_outcome.get("result", "")).lower()
+        if not reserve_outcome.get("success"):
+            await params.result_callback(
+                {"result": "I couldn't open the booking flow yet. Please ask me to reserve the hotel again first."},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        if "guest form is not visible yet" in reserve_text:
+            await params.result_callback(
+                {"result": "The guest form is still loading. Please wait a moment, then tell me to fill the form."},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+
+    if _should_apply_demo_mock_guest_info(latest_user_text, args):
+        args = _apply_demo_mock_guest_info(args)
+        logger.info(
+            "Applying demo mock guest profile for fill_guest_info: "
+            f"{ {k: args.get(k) for k in ('full_name', 'email', 'region', 'city', 'address_line1', 'phone')} }"
+        )
+
+    # Hard guard: do not call fill without any meaningful guest data.
+    meaningful_keys = ("full_name", "first_name", "last_name", "email", "phone", "region", "city", "address_line1")
+    has_meaningful_data = any(str((args or {}).get(key, "")).strip() for key in meaningful_keys)
+    if not has_meaningful_data:
+        await params.result_callback(
+            {
+                "result": (
+                    "Please provide the required guest details first: full name, email, region, and phone number."
+                )
+            },
+            properties=FunctionCallResultProperties(run_llm=True),
+        )
+        return
+
     logger.info(f"Tool 'fill_guest_info' called with args: {args}")
     await invoke_browser_action("fill_guest_info", args, params.result_callback)
 
@@ -587,6 +716,14 @@ async def continue_to_payment_tool(params: FunctionCallParams):
 
 async def run_pipeline_for_connection(webrtc_connection: SmallWebRTCConnection):
     """Spin up a full Pipecat pipeline for one WebRTC peer connection."""
+    global _reserve_action_task, _last_reserve_outcome, _latest_user_transcript
+    _reserve_action_task = None
+    _last_reserve_outcome = None
+    _latest_user_transcript = ""
+    _inflight_browser_actions.clear()
+    _inflight_browser_actions_by_type.clear()
+    _recent_browser_action_results.clear()
+    _recent_action_completion.clear()
     logger.info(f"Starting pipeline for pc_id: {webrtc_connection.pc_id}")
 
     # --- Nova Sonic LLM ---

@@ -704,7 +704,7 @@ export default function App() {
                                 margin: 0, fontSize: 12, color: '#6366f1',
                                 fontStyle: 'italic', lineHeight: 1.5,
                             }}>
-                                "Find me a luxury boutique hotel in Paris with a balcony view of the Eiffel Tower for next weekend."
+                                "Find me a hotel in Ho Chi Minh City for next weekend."
                             </p>
                         </div>
                     )}

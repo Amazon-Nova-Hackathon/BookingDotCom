@@ -263,13 +263,36 @@ class BookingAgent:
         except Exception:
             return False
 
+        # Fast-path click attempts to avoid spending hundreds of milliseconds
+        # on each failing selector.
         for selector in selectors:
+            locator = self.page.locator(selector).first
             try:
-                locator = self.page.locator(selector).first
                 if await locator.count() == 0:
                     continue
-                await locator.scroll_into_view_if_needed(timeout=500)
-                await locator.click(timeout=500)
+                if not await locator.is_visible():
+                    continue
+                try:
+                    await locator.scroll_into_view_if_needed(timeout=250)
+                except Exception:
+                    pass
+                await locator.click(timeout=220)
+                logger.info(f"Clicked selector: {selector}")
+                return True
+            except Exception:
+                continue
+
+        # Second pass with a slightly higher timeout for dynamic buttons.
+        for selector in selectors:
+            locator = self.page.locator(selector).first
+            try:
+                if await locator.count() == 0:
+                    continue
+                try:
+                    await locator.scroll_into_view_if_needed(timeout=500)
+                except Exception:
+                    pass
+                await locator.click(timeout=700)
                 logger.info(f"Clicked selector: {selector}")
                 return True
             except Exception:
@@ -1442,7 +1465,7 @@ class BookingAgent:
 
             if "searchresults" in self.page.url:
                 selected_name = await self._open_hotel_from_results(selected_name, hotel_index)
-                await self.page.wait_for_timeout(300)
+                await self.page.wait_for_timeout(120)
                 await self._dismiss_overlays()
             elif not selected_name:
                 selected_name = await self._get_first_text([
@@ -1470,7 +1493,7 @@ class BookingAgent:
 
             if availability_clicked:
                 await self._wait_brief_navigation()
-                await self.page.wait_for_timeout(250)
+                await self.page.wait_for_timeout(120)
                 await self._dismiss_overlays()
 
             try:
@@ -1503,16 +1526,16 @@ class BookingAgent:
 
             if reserve_clicked:
                 await self._wait_brief_navigation()
-                await self.page.wait_for_timeout(250)
+                await self.page.wait_for_timeout(120)
                 await self._dismiss_overlays()
 
                 # We will no longer click the second confirmation button here.
                 # It will be done after filling out the form.
-            form_visible = await self._scroll_to_guest_form(max_rounds=5)
+            form_visible = await self._scroll_to_guest_form(max_rounds=4)
             if not form_visible:
-                await self.page.wait_for_timeout(900)
+                await self.page.wait_for_timeout(450)
                 await self._dismiss_overlays()
-                form_visible = await self._scroll_to_guest_form(max_rounds=7)
+                form_visible = await self._scroll_to_guest_form(max_rounds=5)
             required_fields = await self._collect_guest_fields(required_only=True)
             optional_fields = await self._collect_guest_fields(required_only=False)
             special_questions = await self._collect_special_form_questions()
@@ -1742,7 +1765,12 @@ class BookingAgent:
 
             return {
                 "success": True,
-                "result": "I moved to the next booking step. The payment page or final details step should now be open." + page_summary,
+                "result": (
+                    "I moved to the next booking step. "
+                    "The payment page or final details step should now be open. "
+                    "Please enter the payment details manually on the website."
+                    + page_summary
+                ),
             }
         except Exception as exc:
             await self._snap()
