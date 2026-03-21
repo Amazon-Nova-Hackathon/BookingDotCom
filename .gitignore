@@ -1,0 +1,98 @@
+# --- Python ---
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+env/
+venv/
+.venv/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python tooling
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+*.log
+
+# IDE/Editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# --- Node / Frontend (React / Playwright JS/TS) ---
+# Node modules
+frontend/node_modules/
+node_modules/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Lock files (optional if you want to track)
+# package-lock.json
+# yarn.lock
+
+# Build output
+dist/
+build/
+frontend/build/
+frontend/dist/
+
+# Playwright test artifacts
+playwright-report/
+test-results/
+
+# Optional coverage
+coverage/
+
+# --- Environment / Secrets ---
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# dotenv files
+.env.*.local
+.envrc
+
+# --- Docker ---
+# Docker files should be committed, but local overrides or builds omitted
+docker-compose.override.yml
+.env.docker
+
+# Docker volumes
+volumes/
+*.dockerignore
+
+# --- IDE / OS Metadata ---
+.DS_Store
+Thumbs.db
+
+# --- Python packaging ---
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+MANIFEST
+
+# --- Misc ---
+*.swp
+*.tmp
+*.temp
+*.bak
